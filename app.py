@@ -7,7 +7,7 @@ from streamlit_gsheets import GSheetsConnection
 # ページ基本設定
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="我が家の株主優待管理",
+    page_title="株主優待管理",
     page_icon="🎁",
     layout="wide",
     initial_sidebar_state="expanded"
