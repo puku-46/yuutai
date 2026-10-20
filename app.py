@@ -60,7 +60,7 @@ st.caption("Googleスプレッドシートとリアルタイム同期中！家�
 # ログアウトボタンをサイドバーに追加
 if st.sidebar.button("🔒 ログアウト"):
     del st.session_state["password_correct"]
-    st.experimental_rerun()
+    st.rerun()  # 修正箇所 1
 
 # Googleスプレッドシートへの接続
 @st.cache_resource
@@ -110,7 +110,7 @@ selected_owner = st.sidebar.selectbox("名義で絞り込み", owner_list)
 
 if st.sidebar.button("🔄 スプレッドシートの最新データを再読み込み"):
     st.cache_data.clear()
-    st.experimental_rerun()
+    st.rerun()  # 修正箇所 2
 
 # フィルタリング
 filtered_df = df.copy()
@@ -219,7 +219,7 @@ with tab2:
             }
             updated_df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
             save_data(updated_df)
-            st.experimental_rerun()
+            st.rerun()  # 修正箇所 3
 
 # TAB 3: 編集・削除
 with tab3:
@@ -264,12 +264,12 @@ with tab3:
                     e_code, e_name, e_owner, e_gift_detail, e_category, e_value, e_rights_month, e_arrival_date, e_expiry_date, e_status, e_memo
                 ]
                 save_data(df)
-                st.experimental_rerun()
+                st.rerun()  # 修正箇所 4
 
             if delete_btn:
                 updated_df = df[df["ID"] != target_id]
                 save_data(updated_df)
-                st.experimental_rerun()
+                st.rerun()  # 修正箇所 5
 
 # TAB 4: 統計
 with tab4:
