@@ -12,7 +12,7 @@ from common import (
     today_jst,
 )
  
-st.page_link("pages/1_優待.py", label="優待管理", icon="🎁")
+setup_page("優待管理", "🎁")
  
 # ---------------------------------------------------------
 # 定数
