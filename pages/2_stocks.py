@@ -12,6 +12,7 @@
 import time
 import unicodedata
 from datetime import datetime
+from zoneinfo import ZoneInfo
  
 import pandas as pd
 import streamlit as st
@@ -201,17 +202,22 @@ def build_table(kind: str, df: pd.DataFrame, threshold: float) -> pd.DataFrame:
         }
         if kind == "holdings":
             cost, qty = r["取得単価"], r["株数"]
-            row["取得単価"] = cost
+            has_cost = pd.notna(cost) and cost > 0  # 空欄・0は「未入力」として扱う
+            row["取得単価"] = cost if has_cost else None
             row["株数"] = qty
             row["評価額"] = last * qty if last is not None else None
-            row["含み損益"] = (last - cost) * qty if last is not None else None
-            row["損益率%"] = (last - cost) / cost * 100 if last is not None and cost else None
+            row["含み損益"] = (last - cost) * qty if last is not None and has_cost else None
+            row["損益率%"] = (last - cost) / cost * 100 if last is not None and has_cost else None
         else:
             target = r["目標価格"]
             row["目標価格"] = target
             row["目標との差%"] = (last - target) / target * 100 if last is not None and target else None
         rows.append(row)
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    for c in out.columns:
+        if c not in ("銘柄コード", "銘柄名", "通知"):
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
  
  
 def style_table(table: pd.DataFrame, kind: str):
@@ -260,6 +266,9 @@ def render_summary(table: pd.DataFrame) -> None:
     c2.metric("含み損益 合計", f"{pnl:+,.0f} 円", f"{pnl / cost * 100:+.2f}%" if cost else None)
     c3.metric("銘柄数", f"{len(table)} 銘柄")
     c4.metric("しきい値超え", f"{alerts} 銘柄")
+    missing = int(table["取得単価"].isna().sum())
+    if missing:
+        st.caption(f"※ 取得単価が未入力の {missing} 銘柄は、含み損益の合計に含めていません。")
  
  
 def render_add_form(kind: str, owner: str, df: pd.DataFrame) -> None:
@@ -268,7 +277,10 @@ def render_add_form(kind: str, owner: str, df: pd.DataFrame) -> None:
             code_in = st.text_input("銘柄コード(例: 7203)")
             name_in = st.text_input("銘柄名(空欄なら自動取得)")
             if kind == "holdings":
-                cost = st.number_input("取得単価(円)", min_value=0.0, step=1.0)
+                cost = st.number_input(
+                    "取得単価(円)", min_value=0.0, step=1.0,
+                    help="分からない場合は0のままで構いません(その銘柄の含み損益は表示されません)。あとから編集できます。",
+                )
                 qty = st.number_input("株数", min_value=0, step=100, value=100)
             else:
                 target = st.number_input("目標価格(円)", min_value=0.0, step=1.0)
@@ -291,6 +303,32 @@ def render_add_form(kind: str, owner: str, df: pd.DataFrame) -> None:
         else:
             new = {"銘柄コード": code, "銘柄名": name, "目標価格": num_str(target)}
         apply_and_save(kind, COLUMNS[kind], make_upsert(kind, owner, new), f"{name}({code})を登録しました。")
+ 
+ 
+def _num(v) -> float:
+    return float(v) if pd.notna(v) else 0.0
+ 
+ 
+def render_edit_form(kind: str, owner: str, df: pd.DataFrame) -> None:
+    """登録済みの銘柄の取得単価・株数(注目株は目標価格)を、選んで書き換える"""
+    if df.empty:
+        return
+    label_text = "取得単価・株数" if kind == "holdings" else "目標価格"
+    with st.expander(f"✏ 登録済みの銘柄を編集({label_text})"):
+        options = {f"{r['銘柄名']}({r['銘柄コード']})": i for i, r in df.iterrows()}
+        label = st.selectbox("編集する銘柄", list(options), key=f"edit_sel_{kind}_{owner}")
+        r = df.iloc[options[label]]
+        code = r["銘柄コード"]
+        k = f"{kind}_{owner}_{code}"  # 銘柄を切り替えたとき、入力欄の値も切り替わるようにする
+        if kind == "holdings":
+            cost = st.number_input("取得単価(円)", min_value=0.0, step=1.0, value=_num(r["取得単価"]), key=f"edit_cost_{k}")
+            qty = st.number_input("株数", min_value=0, step=100, value=int(_num(r["株数"])), key=f"edit_qty_{k}")
+            new = {"銘柄コード": code, "銘柄名": r["銘柄名"], "取得単価": num_str(cost), "株数": num_str(qty)}
+        else:
+            target = st.number_input("目標価格(円)", min_value=0.0, step=1.0, value=_num(r["目標価格"]), key=f"edit_target_{k}")
+            new = {"銘柄コード": code, "銘柄名": r["銘柄名"], "目標価格": num_str(target)}
+        if st.button("更新する", key=f"edit_btn_{k}"):
+            apply_and_save(kind, COLUMNS[kind], make_upsert(kind, owner, new), f"{r['銘柄名']}({code})を更新しました。")
  
  
 def render_delete_form(kind: str, owner: str, df: pd.DataFrame) -> None:
@@ -318,6 +356,7 @@ def render_stock_tab(kind: str, owner: str, df: pd.DataFrame, threshold: float) 
         render_summary(table)
     st.dataframe(style_table(table, kind), hide_index=True)
     st.caption(f"⚠ = 前日比が ±{threshold:g}% 以上(通知対象)")
+    render_edit_form(kind, owner, df)
     render_delete_form(kind, owner, df)
  
  
@@ -381,7 +420,7 @@ def main() -> None:
  
     left, right = st.columns([4, 1])
     left.caption(
-        f"最終取得: {datetime.now():%Y-%m-%d %H:%M:%S} / "
+        f"最終取得: {datetime.now(ZoneInfo('Asia/Tokyo')):%Y-%m-%d %H:%M:%S} / "
         f"{CACHE_SECONDS // 60}分以内の再表示は前回の値を使用 / 日本株は約20分遅延の場合あり"
     )
     if right.button("🔄 最新の株価に更新"):
