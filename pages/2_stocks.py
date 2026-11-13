@@ -67,6 +67,31 @@ def typed(kind: str, df: pd.DataFrame) -> pd.DataFrame:
     return df
  
  
+def diagnose() -> None:
+    """読み込み失敗時に、アプリが実際に見ているスプレッドシートとタブ名を表示する(原因の切り分け用)"""
+    try:
+        import gspread
+ 
+        conf = dict(st.secrets["connections"]["gsheets"])
+        url = conf.pop("spreadsheet")
+        conf.pop("worksheet", None)
+        sh = gspread.service_account_from_dict(conf).open_by_url(url)
+        titles = [ws.title for ws in sh.worksheets()]
+        st.write(f"アプリが見ているスプレッドシート: 「{sh.title}」")
+        st.write("タブ名の一覧: " + " / ".join(f"「{t}」" for t in titles))
+        missing = [k for k in COLUMNS if k not in titles]
+        if missing:
+            st.warning(
+                "このスプレッドシートに次のタブがありません: "
+                + ", ".join(missing)
+                + "。タブ名(半角英数・小文字)で追加し、1行目にヘッダーを入れてください。"
+            )
+        else:
+            st.info("3つのタブはあります。1行目のヘッダーと、タブ名の前後の空白を確認してください。")
+    except Exception as e:
+        st.write(f"診断できませんでした: {type(e).__name__}: {str(e)[:200]}")
+ 
+ 
 def load_all() -> dict:
     data = {}
     for kind, cols in COLUMNS.items():
@@ -77,6 +102,8 @@ def load_all() -> dict:
                 "シート名(半角英数)・Secretsの設定・共有設定を確認してください。"
                 f"\n\n詳細: {err}"
             )
+            with st.expander("🔍 原因を調べる", expanded=True):
+                diagnose()
             if st.button("🔄 再読み込み"):
                 st.rerun()
             st.stop()
