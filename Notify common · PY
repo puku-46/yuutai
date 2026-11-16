@@ -1,0 +1,84 @@
+"""通知スクリプト共通の部品(スプレッドシートを開く / LINE送信)
+
+環境変数:
+  GCP_SERVICE_ACCOUNT_JSON  サービスアカウントのJSONの中身(未設定なら service_account.json を読む)
+  SPREADSHEET_URL           スプレッドシートのURL(推奨。画面アプリのSecretsと同じもの)
+  SPREADSHEET_NAME          URLを使わない場合のスプレッドシート名(省略時は「優待管理」)
+  MAKE_WEBHOOK_URL          MakeのWebhook URL
+  LINE_USER_IDS             名義ごとのLINE userId(JSON)
+                            例: {"夫": "Uxxxxxxxx...", "妻": "Uyyyyyyyy..."}
+
+Makeに渡す内容(JSON):
+  {"owner": "夫", "to": "Uxxxx...", "message": "本文"}
+  → Make側は、LINEの「プッシュメッセージ送信」の宛先に to、本文に message を割り当てる。
+
+LINE送信のテスト(単体で実行):
+  python notify_common.py 夫 "テスト送信です"
+"""
+import json
+import os
+import sys
+
+import gspread
+import requests
+
+SPREADSHEET_URL = os.environ.get("SPREADSHEET_URL", "")
+SPREADSHEET_NAME = os.environ.get("SPREADSHEET_NAME", "優待管理")
+WEBHOOK_URL = os.environ.get("MAKE_WEBHOOK_URL", "")
+
+
+class MissingDestination(Exception):
+    """名義に対応するLINEの宛先(userId)が設定されていない"""
+
+
+def open_spreadsheet():
+    info = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    if info:
+        client = gspread.service_account_from_dict(json.loads(info))
+    else:
+        client = gspread.service_account(filename="service_account.json")
+    return client.open_by_url(SPREADSHEET_URL) if SPREADSHEET_URL else client.open(SPREADSHEET_NAME)
+
+
+def line_destinations() -> dict:
+    """名義 -> LINE userId"""
+    raw = os.environ.get("LINE_USER_IDS", "")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return {str(k): str(v) for k, v in data.items() if v}
+    except (json.JSONDecodeError, AttributeError):
+        print("[警告] LINE_USER_IDS がJSONとして読めません。", file=sys.stderr)
+        return {}
+
+
+def send_line(owner: str, text: str) -> None:
+    """Make の Webhook に {owner, to, message} をPOSTする。
+    宛先がない名義には送らない(間違って家族グループなどへ流れないようにするため)。"""
+    to = line_destinations().get(owner, "")
+    if not to:
+        raise MissingDestination(f"「{owner}」のLINE宛先が LINE_USER_IDS にありません")
+    res = requests.post(WEBHOOK_URL, json={"owner": owner, "to": to, "message": text}, timeout=15)
+    res.raise_for_status()
+
+
+def _send_test(argv) -> int:
+    if len(argv) < 2:
+        print('使い方: python notify_common.py 名義 "メッセージ"   例: python notify_common.py 夫 "テスト"')
+        return 2
+    if not WEBHOOK_URL:
+        print("環境変数 MAKE_WEBHOOK_URL を設定してください。")
+        return 2
+    owner, text = argv[0], " ".join(argv[1:])
+    try:
+        send_line(owner, text)
+    except Exception as e:
+        print(f"[エラー] {type(e).__name__}: {e}")
+        return 1
+    print(f"{owner} 宛てに送信しました。LINEを確認してください。")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_send_test(sys.argv[1:]))
