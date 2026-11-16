@@ -1,0 +1,146 @@
+"""優待の有効期限が近いものを、名義ごとに本人宛てのLINEでお知らせする
+
+使い方:
+  python notify_yutai.py --dry-run                # 送信せず、送る内容を表示(まずこれで確認)
+  python notify_yutai.py --dry-run --within 60    # 60日以内のものを全部表示(テスト用)
+  python notify_yutai.py --only 夫                # 夫宛てだけ送る(個別宛てのテスト用)
+  python notify_yutai.py                          # 本番(期限まで30・14・7・3・1・0日の日に通知)
+
+通知する日の考え方:
+  毎日同じものを送り続けないよう、期限までの日数が 30 / 14 / 7 / 3 / 1 / 0 日 の日だけ通知します
+  (毎日1回、このスクリプトを動かす想定)。 --days "10,5,1" で日数を変えられます。
+
+対象:
+  優待タブ(既定は先頭のタブ。ページ1と同じ)の行のうち、ステータスが「利用完了」「期限切れ」
+  以外で、有効期限が入っているもの。
+
+共通の環境変数は notify_common.py を参照(スプレッドシート・MakeのURL・LINE宛先)。
+追加: YUTAI_WORKSHEET  優待タブの名前(省略時は先頭のタブ)
+"""
+import argparse
+import os
+import re
+import sys
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
+from notify_common import WEBHOOK_URL, line_destinations, open_spreadsheet, send_line
+
+JST = ZoneInfo("Asia/Tokyo")
+YUTAI_WORKSHEET = os.environ.get("YUTAI_WORKSHEET", "")
+DEFAULT_ALERT_DAYS = [30, 14, 7, 3, 1, 0]
+DONE_STATUSES = ("利用完了", "期限切れ")  # ページ1の DONE_STATUSES と同じ
+REQUIRED_COLUMNS = ["銘柄名", "名義", "優待内容", "数量/金額", "有効期限", "ステータス"]
+
+
+# ------------------------------------------------------------
+# 読み込み
+# ------------------------------------------------------------
+def parse_date(value):
+    """'2027-12-31' / '2027/12/31' / '2027-12-31 00:00:00' などを date に。失敗・空欄は None"""
+    m = re.search(r"(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})", str(value))
+    if not m:
+        return None
+    try:
+        return date(int(m[1]), int(m[2]), int(m[3]))
+    except ValueError:
+        return None
+
+
+def read_rows(ss) -> list:
+    ws = ss.worksheet(YUTAI_WORKSHEET) if YUTAI_WORKSHEET else ss.get_worksheet(0)
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return []
+    header = [h.strip() for h in values[0]]
+    missing = [c for c in REQUIRED_COLUMNS if c not in header]
+    if missing:
+        raise ValueError(f"優待タブの1行目に次の列が必要です: {', '.join(missing)}")
+    rows = [dict(zip(header, [c.strip() for c in row])) for row in values[1:]]
+    return [r for r in rows if any(r.values())]
+
+
+# ------------------------------------------------------------
+# 判定とメッセージ作成(ネットワーク不要の部分)
+# ------------------------------------------------------------
+def collect_alerts(rows: list, today: date, milestones: list, within=None) -> list:
+    """通知対象の行を返す。within が指定されたら、期限まで within 日以内のものを全て対象にする。"""
+    alerts = []
+    for r in rows:
+        if r.get("ステータス", "") in DONE_STATUSES:
+            continue
+        expiry = parse_date(r.get("有効期限", ""))
+        if expiry is None:
+            continue
+        left = (expiry - today).days
+        hit = (0 <= left <= within) if within is not None else (left in milestones)
+        if hit:
+            alerts.append({**r, "_left": left, "_expiry": expiry})
+    return alerts
+
+
+def format_line(a: dict) -> str:
+    label = "本日まで" if a["_left"] == 0 else f"あと{a['_left']}日"
+    parts = [a.get("銘柄名", ""), a.get("優待内容", ""), a.get("数量/金額", "")]
+    detail = " ".join(p for p in parts if p)
+    return f"【{label}】{detail}(〜{a['_expiry']:%m/%d})"
+
+
+def build_messages(alerts: list, today: date) -> dict:
+    """名義 -> 本文。期限が近い順に並べる。"""
+    by_owner = {}
+    for a in alerts:
+        by_owner.setdefault(a.get("名義", "") or "(名義なし)", []).append(a)
+    messages = {}
+    for owner, items in by_owner.items():
+        items.sort(key=lambda a: (a["_left"], a.get("銘柄名", "")))
+        lines = [f"🎁 優待の期限が近づいています({today:%m/%d}時点)"]
+        lines += [format_line(a) for a in items]
+        messages[owner] = "\n".join(lines)
+    return messages
+
+
+# ------------------------------------------------------------
+# メイン
+# ------------------------------------------------------------
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true", help="送信せず内容を表示する")
+    ap.add_argument("--within", type=int, help="期限まで N 日以内のものを全て対象にする(テスト用)")
+    ap.add_argument("--days", default=",".join(map(str, DEFAULT_ALERT_DAYS)),
+                    help='通知する「期限までの日数」。例: "30,14,7,3,1,0"')
+    ap.add_argument("--only", help="この名義の分だけ処理する(個別宛てのテスト用)")
+    args = ap.parse_args(argv)
+
+    milestones = [int(x) for x in args.days.split(",") if x.strip()]
+    today = datetime.now(JST).date()
+
+    rows = read_rows(open_spreadsheet())
+    messages = build_messages(collect_alerts(rows, today, milestones, args.within), today)
+    if args.only:
+        messages = {o: t for o, t in messages.items() if o == args.only}
+    if not messages:
+        print("お知らせする優待はありませんでした。")
+        return 0
+
+    destinations = line_destinations()
+    failed = 0
+    for owner, text in messages.items():
+        if args.dry_run:
+            dest = "宛先あり" if destinations.get(owner) else "宛先なし(LINE_USER_IDSに未登録)"
+            print(f"--- {owner} 宛て(dry-run / {dest}) ---\n{text}\n")
+            continue
+        if not WEBHOOK_URL:
+            print(f"--- {owner} 宛て(MAKE_WEBHOOK_URL未設定のため表示のみ) ---\n{text}\n")
+            continue
+        try:
+            send_line(owner, text)
+            print(f"{owner} 宛てに送信しました。")
+        except Exception as e:
+            failed += 1
+            print(f"[エラー] {owner} 宛ての送信に失敗: {e}", file=sys.stderr)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
