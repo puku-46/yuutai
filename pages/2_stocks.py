@@ -1,41 +1,46 @@
 """pages/2_stocks.py — 株価確認(名義ごとの保有株 / 注目株 / 通知しきい値)
- 
+
 置き場所:  リポジトリの pages/ フォルダ(pages/2_stocks.py)
 必要:      requirements.txt に yfinance を追加
 認証・接続: common.py の setup_page / fetch_sheet / apply_and_save をそのまま使う
- 
+
 スプレッドシートのタブ(1行目がヘッダー。名前は半角英数で一致させる):
   holdings  名義 / 銘柄コード / 銘柄名 / 取得単価 / 株数
   watch     名義 / 銘柄コード / 銘柄名 / 目標価格
   settings  名義 / しきい値(%) / 通知ON
+  brokers   証券会社 / URL   (証券会社とリンク先の一覧。家族で共通。無くても他の機能は動く)
+holdings の「証券会社」には、brokers に登録した証券会社名を入れる(表で名前をクリックするとリンク先が開く)。
+※ログインID・パスワード・口座番号は、スプレッドシートに入れないこと。
 """
 import time
 import unicodedata
 from datetime import datetime
 from zoneinfo import ZoneInfo
- 
+
 import pandas as pd
 import streamlit as st
 import yfinance as yf
- 
+
 from common import apply_and_save, fetch_sheet, setup_page
- 
+
 # ---------------------------------------------------------
 # 定数
 # ---------------------------------------------------------
 CACHE_SECONDS = 300  # 株価を使い回す時間(秒)
 DEFAULT_MEMBERS = ["夫", "妻", "長男", "長女", "その他"]  # ページ1の OWNERS と同じ(settingsタブが空のときだけ使う)
 DEFAULT_THRESHOLD = 3.0  # 前日比 ±% の初期値
- 
+
 COLUMNS = {
-    "holdings": ["名義", "銘柄コード", "銘柄名", "取得単価", "株数"],
+    "holdings": ["名義", "銘柄コード", "銘柄名", "取得単価", "株数", "証券会社"],
     "watch": ["名義", "銘柄コード", "銘柄名", "目標価格"],
     "settings": ["名義", "しきい値(%)", "通知ON"],
+    "brokers": ["証券会社", "URL"],
 }
+NO_BROKER = "（選択しない）"
 NUMERIC_COLUMNS = ["取得単価", "株数", "目標価格", "しきい値(%)"]
 TRUE_VALUES = ["TRUE", "1", "はい", "ON"]
- 
- 
+
+
 # ---------------------------------------------------------
 # スプレッドシートの読み書き(common.py の関数を利用)
 # ---------------------------------------------------------
@@ -43,15 +48,15 @@ def num_str(v) -> str:
     """数値をシートに書く文字列にする(300.0 -> '300'、2500.5 -> '2500.5')"""
     v = float(v)
     return str(int(v)) if v.is_integer() else str(round(v, 4))
- 
- 
+
+
 def default_settings_str() -> pd.DataFrame:
     n = len(DEFAULT_MEMBERS)
     return pd.DataFrame(
         {"名義": DEFAULT_MEMBERS, "しきい値(%)": [num_str(DEFAULT_THRESHOLD)] * n, "通知ON": ["TRUE"] * n}
     )
- 
- 
+
+
 def typed(kind: str, df: pd.DataFrame) -> pd.DataFrame:
     """common.fetch_sheet は全て文字列で返すので、数値・真偽値に直す"""
     if kind == "settings" and df.empty:
@@ -62,17 +67,17 @@ def typed(kind: str, df: pd.DataFrame) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ""), errors="coerce")
     if "通知ON" in df:
         df["通知ON"] = df["通知ON"].astype(str).str.strip().str.upper().isin(TRUE_VALUES)
-    for c in ["名義", "銘柄コード", "銘柄名"]:
+    for c in ["名義", "銘柄コード", "銘柄名", "証券会社", "URL"]:
         if c in df:
             df[c] = df[c].astype(str).str.strip()
     return df
- 
- 
+
+
 def diagnose() -> None:
     """読み込み失敗時に、アプリが実際に見ているスプレッドシートとタブ名を表示する(原因の切り分け用)"""
     try:
         import gspread
- 
+
         conf = dict(st.secrets["connections"]["gsheets"])
         url = conf.pop("spreadsheet")
         conf.pop("worksheet", None)
@@ -88,15 +93,22 @@ def diagnose() -> None:
                 + "。タブ名(半角英数・小文字)で追加し、1行目にヘッダーを入れてください。"
             )
         else:
-            st.info("3つのタブはあります。1行目のヘッダーと、タブ名の前後の空白を確認してください。")
+            st.info(f"{len(COLUMNS)}つのタブはあります。1行目のヘッダーと、タブ名の前後の空白を確認してください。")
     except Exception as e:
         st.write(f"診断できませんでした: {type(e).__name__}: {str(e)[:200]}")
- 
- 
+
+
 def load_all() -> dict:
     data = {}
     for kind, cols in COLUMNS.items():
         df, ok, err = fetch_sheet(kind, cols)
+        if not ok and kind == "brokers":  # 証券会社の一覧は任意。読めなくても他の機能は使えるようにする
+            st.warning(
+                "「brokers」タブを読み込めませんでした。証券会社のリンクを使うには、スプレッドシートに "
+                "brokers タブを作り、1行目に「証券会社」「URL」と入力してください。"
+            )
+            data[kind] = typed(kind, pd.DataFrame(columns=cols))
+            continue
         if not ok:
             st.error(
                 f"スプレッドシートの「{kind}」シートの読み込みに失敗しました。"
@@ -110,28 +122,43 @@ def load_all() -> dict:
             st.stop()
         data[kind] = typed(kind, df)
     return data
- 
- 
+
+
 def rows_of(df: pd.DataFrame, owner: str) -> pd.DataFrame:
     return df[df["名義"] == owner].reset_index(drop=True)
- 
- 
+
+
 def make_upsert(kind: str, owner: str, new_row: dict):
     """保存直前の最新データに対して、この名義の同じ銘柄を置き換える(なければ追加)"""
     def modifier(latest: pd.DataFrame) -> pd.DataFrame:
         keep = latest[~((latest["名義"] == owner) & (latest["銘柄コード"] == new_row["銘柄コード"]))]
         new = pd.DataFrame([{"名義": owner, **new_row}])
         out = new if keep.empty else pd.concat([keep, new], ignore_index=True)
-        return out[COLUMNS[kind]]
+        return out.reindex(columns=COLUMNS[kind]).fillna("")  # 列が増えた古いデータでも、空欄で埋める
     return modifier
- 
- 
+
+
+def make_broker_upsert(name: str, url: str):
+    def modifier(latest: pd.DataFrame) -> pd.DataFrame:
+        keep = latest[latest["証券会社"] != name]
+        new = pd.DataFrame([{"証券会社": name, "URL": url}])
+        out = new if keep.empty else pd.concat([keep, new], ignore_index=True)
+        return out[COLUMNS["brokers"]]
+    return modifier
+
+
+def make_broker_delete(names: list):
+    def modifier(latest: pd.DataFrame) -> pd.DataFrame:
+        return latest[~latest["証券会社"].isin(names)]
+    return modifier
+
+
 def make_delete(owner: str, codes: list):
     def modifier(latest: pd.DataFrame) -> pd.DataFrame:
         return latest[~((latest["名義"] == owner) & (latest["銘柄コード"].isin(codes)))]
     return modifier
- 
- 
+
+
 # ---------------------------------------------------------
 # 株価取得(common.py の apply_and_save が st.cache_data.clear() を呼ぶため、
 # 株価の使い回しは cache_resource に置く。保存のたびに取り直しにならない)
@@ -139,18 +166,18 @@ def make_delete(owner: str, codes: list):
 @st.cache_resource
 def _store() -> dict:
     return {"prices": {}, "names": {}}
- 
- 
+
+
 def clear_prices() -> None:
     _store()["prices"].clear()
- 
- 
+
+
 def normalize_code(raw: str) -> str:
     """'7203' / '７２０３' / '7203.t' -> '7203.T'"""
     code = unicodedata.normalize("NFKC", raw).strip().upper()
     return code if code.endswith(".T") else f"{code}.T"
- 
- 
+
+
 def fetch_price(code: str) -> dict:
     """現在値と前日終値。取得できなければ空のdict。"""
     cache = _store()["prices"]
@@ -169,8 +196,8 @@ def fetch_price(code: str) -> dict:
         return {}
     cache[code] = (time.time(), data)
     return data
- 
- 
+
+
 def fetch_name(code: str) -> str:
     names = _store()["names"]
     if code not in names:
@@ -180,26 +207,35 @@ def fetch_name(code: str) -> str:
         except Exception:
             return ""
     return names[code]
- 
- 
+
+
 # ---------------------------------------------------------
 # 表示用データの組み立て
 # ---------------------------------------------------------
-def build_table(kind: str, df: pd.DataFrame, threshold: float) -> pd.DataFrame:
+def broker_link(name, urls: dict) -> str:
+    """表のリンク用の値。'https://…#証券会社名' の形にして、表示は # 以降の名前だけにする。
+    リンク先が未登録なら '#証券会社名'(クリックしても移動しない)"""
+    name = "" if name is None or pd.isna(name) else str(name).strip()
+    return f"{urls.get(name, '')}#{name}" if name else ""
+
+
+def build_table(kind: str, df: pd.DataFrame, threshold: float, broker_urls: dict = None) -> pd.DataFrame:
+    broker_urls = broker_urls or {}
     rows = []
     for _, r in df.iterrows():
         p = fetch_price(r["銘柄コード"])
         last, prev = p.get("last"), p.get("prev")
         chg = (last - prev) if last is not None and prev else None
         pct = (chg / prev * 100) if chg is not None else None
-        row = {
-            "銘柄コード": r["銘柄コード"],
-            "銘柄名": r["銘柄名"],
+        row = {"銘柄コード": r["銘柄コード"], "銘柄名": r["銘柄名"]}
+        if kind == "holdings":
+            row["証券会社"] = broker_link(r.get("証券会社"), broker_urls)
+        row.update({
             "通知": "⚠" if pct is not None and abs(pct) >= threshold else "",
             "現在値": last,
             "前日比": chg,
             "前日比%": pct,
-        }
+        })
         if kind == "holdings":
             cost, qty = r["取得単価"], r["株数"]
             has_cost = pd.notna(cost) and cost > 0  # 空欄・0は「未入力」として扱う
@@ -215,18 +251,18 @@ def build_table(kind: str, df: pd.DataFrame, threshold: float) -> pd.DataFrame:
         rows.append(row)
     out = pd.DataFrame(rows)
     for c in out.columns:
-        if c not in ("銘柄コード", "銘柄名", "通知"):
+        if c not in ("銘柄コード", "銘柄名", "証券会社", "通知"):
             out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
- 
- 
+
+
 def style_table(table: pd.DataFrame, kind: str):
     """プラスは緑、マイナスは赤(日本の株アプリは逆の場合もあるので好みで入れ替え可)"""
     def color(v):
         if pd.isna(v):
             return ""
         return "color: #d62728" if v < 0 else "color: #2ca02c" if v > 0 else ""
- 
+
     signed = ["前日比", "前日比%"] + (["含み損益", "損益率%"] if kind == "holdings" else [])
     fmt = {c: "{:,.1f}" for c in ["現在値", "取得単価", "目標価格"] if c in table}
     fmt["前日比"] = "{:+,.1f}"
@@ -237,13 +273,13 @@ def style_table(table: pd.DataFrame, kind: str):
     styler = table.style.format(fmt, na_rep="-")
     apply_color = getattr(styler, "map", None) or styler.applymap  # pandas新旧両対応
     return apply_color(color, subset=[c for c in signed if c in table])
- 
- 
+
+
 def get_threshold(settings: pd.DataFrame, owner: str) -> float:
     v = settings.loc[settings["名義"] == owner, "しきい値(%)"]
     return float(v.iloc[0]) if len(v) and pd.notna(v.iloc[0]) else DEFAULT_THRESHOLD
- 
- 
+
+
 # ---------------------------------------------------------
 # 画面部品
 # ---------------------------------------------------------
@@ -254,8 +290,8 @@ def select_owner(owners: list) -> str:
     owner = st.radio("誰の株を見ますか?", owners, index=index, horizontal=True)
     st.session_state["selected_owner"] = owner
     return owner
- 
- 
+
+
 def render_summary(table: pd.DataFrame) -> None:
     total = table["評価額"].sum()
     pnl = table["含み損益"].sum()
@@ -269,9 +305,9 @@ def render_summary(table: pd.DataFrame) -> None:
     missing = int(table["取得単価"].isna().sum())
     if missing:
         st.caption(f"※ 取得単価が未入力の {missing} 銘柄は、含み損益の合計に含めていません。")
- 
- 
-def render_add_form(kind: str, owner: str, df: pd.DataFrame) -> None:
+
+
+def render_add_form(kind: str, owner: str, df: pd.DataFrame, broker_names: list = ()) -> None:
     with st.expander("➕ 銘柄を登録・更新", expanded=df.empty):
         with st.form(f"add_{kind}_{owner}", clear_on_submit=True):
             code_in = st.text_input("銘柄コード(例: 7203)")
@@ -282,38 +318,45 @@ def render_add_form(kind: str, owner: str, df: pd.DataFrame) -> None:
                     help="分からない場合は0のままで構いません(その銘柄の含み損益は表示されません)。あとから編集できます。",
                 )
                 qty = st.number_input("株数", min_value=0, step=100, value=100)
+                broker = st.selectbox(
+                    "証券会社", [NO_BROKER] + list(broker_names),
+                    help="一覧にない場合は、下の「証券会社とリンクの登録」で先に登録してください。",
+                )
             else:
                 target = st.number_input("目標価格(円)", min_value=0.0, step=1.0)
             submitted = st.form_submit_button("登録")
- 
+
         if not submitted:
             return
         if not code_in.strip():
             st.error("銘柄コードを入力してください。")
             return
- 
+
         code = normalize_code(code_in)
         if not fetch_price(code):
             st.error(f"{code} の株価が取得できませんでした。コードを確認してください。")
             return
- 
+
         name = name_in.strip() or fetch_name(code) or code
         if kind == "holdings":
-            new = {"銘柄コード": code, "銘柄名": name, "取得単価": num_str(cost), "株数": num_str(qty)}
+            new = {
+                "銘柄コード": code, "銘柄名": name, "取得単価": num_str(cost), "株数": num_str(qty),
+                "証券会社": "" if broker == NO_BROKER else broker,
+            }
         else:
             new = {"銘柄コード": code, "銘柄名": name, "目標価格": num_str(target)}
         apply_and_save(kind, COLUMNS[kind], make_upsert(kind, owner, new), f"{name}({code})を登録しました。")
- 
- 
+
+
 def _num(v) -> float:
     return float(v) if pd.notna(v) else 0.0
- 
- 
-def render_edit_form(kind: str, owner: str, df: pd.DataFrame) -> None:
-    """登録済みの銘柄の取得単価・株数(注目株は目標価格)を、選んで書き換える"""
+
+
+def render_edit_form(kind: str, owner: str, df: pd.DataFrame, broker_names: list = ()) -> None:
+    """登録済みの銘柄の取得単価・株数・証券会社(注目株は目標価格)を、選んで書き換える"""
     if df.empty:
         return
-    label_text = "取得単価・株数" if kind == "holdings" else "目標価格"
+    label_text = "取得単価・株数・証券会社" if kind == "holdings" else "目標価格"
     with st.expander(f"✏ 登録済みの銘柄を編集({label_text})"):
         options = {f"{r['銘柄名']}({r['銘柄コード']})": i for i, r in df.iterrows()}
         label = st.selectbox("編集する銘柄", list(options), key=f"edit_sel_{kind}_{owner}")
@@ -323,14 +366,23 @@ def render_edit_form(kind: str, owner: str, df: pd.DataFrame) -> None:
         if kind == "holdings":
             cost = st.number_input("取得単価(円)", min_value=0.0, step=1.0, value=_num(r["取得単価"]), key=f"edit_cost_{k}")
             qty = st.number_input("株数", min_value=0, step=100, value=int(_num(r["株数"])), key=f"edit_qty_{k}")
-            new = {"銘柄コード": code, "銘柄名": r["銘柄名"], "取得単価": num_str(cost), "株数": num_str(qty)}
+            cur_broker = str(r["証券会社"]).strip() if pd.notna(r["証券会社"]) else ""
+            names = list(broker_names) + ([cur_broker] if cur_broker and cur_broker not in broker_names else [])
+            choices = [NO_BROKER] + names
+            broker = st.selectbox(
+                "証券会社", choices, index=choices.index(cur_broker) if cur_broker else 0, key=f"edit_broker_{k}"
+            )
+            new = {
+                "銘柄コード": code, "銘柄名": r["銘柄名"], "取得単価": num_str(cost), "株数": num_str(qty),
+                "証券会社": "" if broker == NO_BROKER else broker,
+            }
         else:
             target = st.number_input("目標価格(円)", min_value=0.0, step=1.0, value=_num(r["目標価格"]), key=f"edit_target_{k}")
             new = {"銘柄コード": code, "銘柄名": r["銘柄名"], "目標価格": num_str(target)}
         if st.button("更新する", key=f"edit_btn_{k}"):
             apply_and_save(kind, COLUMNS[kind], make_upsert(kind, owner, new), f"{r['銘柄名']}({code})を更新しました。")
- 
- 
+
+
 def render_delete_form(kind: str, owner: str, df: pd.DataFrame) -> None:
     if df.empty:
         return
@@ -340,26 +392,73 @@ def render_delete_form(kind: str, owner: str, df: pd.DataFrame) -> None:
         if st.button("削除する", key=f"delbtn_{kind}_{owner}", disabled=not picked):
             codes = [options[p] for p in picked]
             apply_and_save(kind, COLUMNS[kind], make_delete(owner, codes), f"{len(codes)}銘柄を削除しました。")
- 
- 
-def render_stock_tab(kind: str, owner: str, df: pd.DataFrame, threshold: float) -> None:
-    render_add_form(kind, owner, df)
- 
+
+
+def render_broker_manager(brokers: pd.DataFrame) -> None:
+    """証券会社名とリンク先の登録(家族で共通)"""
+    with st.expander("🏦 証券会社とリンクの登録"):
+        st.caption(
+            "ここで登録した証券会社を、保有株の登録・編集で選べます。保有株の表で証券会社名をクリックすると、"
+            "登録したリンク先が開きます。 ※ログインID・パスワード・口座番号は入れないでください。"
+        )
+        if not brokers.empty:
+            st.dataframe(brokers, hide_index=True)
+        with st.form("add_broker", clear_on_submit=True):
+            b_name = st.text_input("証券会社名(例: ○○証券)")
+            b_url = st.text_input("リンク先(公式サイトのログインページなど。https:// から)")
+            b_saved = st.form_submit_button("登録・更新")
+        if b_saved:
+            b_name, b_url = b_name.strip(), b_url.strip()
+            if not b_name:
+                st.error("証券会社名を入力してください。")
+            elif "#" in b_name:
+                st.error("証券会社名に # は使えません。")
+            elif not b_url.lower().startswith("https://"):
+                st.error("リンク先は https:// から始まるアドレスを入力してください。")
+            else:
+                apply_and_save(
+                    "brokers", COLUMNS["brokers"], make_broker_upsert(b_name, b_url), f"{b_name}を登録しました。"
+                )
+        if not brokers.empty:
+            picked = st.multiselect("削除する証券会社", list(brokers["証券会社"]), key="del_brokers")
+            st.caption("削除しても、保有株に入っている証券会社名はそのまま残ります(リンクだけ使えなくなります)。")
+            if st.button("削除する", key="delbtn_brokers", disabled=not picked):
+                apply_and_save(
+                    "brokers", COLUMNS["brokers"], make_broker_delete(picked), f"{len(picked)}件を削除しました。"
+                )
+
+
+def render_stock_tab(kind: str, owner: str, df: pd.DataFrame, threshold: float, brokers: pd.DataFrame = None) -> None:
+    has_brokers = brokers is not None and not brokers.empty
+    broker_names = list(brokers["証券会社"]) if has_brokers else []
+    broker_urls = dict(zip(brokers["証券会社"], brokers["URL"])) if has_brokers else {}
+
+    render_add_form(kind, owner, df, broker_names)
+
     if df.empty:
         st.info("まだ銘柄が登録されていません。上の「銘柄を登録」から追加してください。")
-        return
- 
-    with st.spinner("株価を取得中..."):
-        table = build_table(kind, df, threshold)
- 
-    if kind == "holdings":
-        render_summary(table)
-    st.dataframe(style_table(table, kind), hide_index=True)
-    st.caption(f"⚠ = 前日比が ±{threshold:g}% 以上(通知対象)")
-    render_edit_form(kind, owner, df)
-    render_delete_form(kind, owner, df)
- 
- 
+    else:
+        with st.spinner("株価を取得中..."):
+            table = build_table(kind, df, threshold, broker_urls)
+
+        if kind == "holdings":
+            render_summary(table)
+        config = None
+        if kind == "holdings":  # 証券会社名をクリックすると、登録したリンク先を開く
+            config = {
+                "証券会社": st.column_config.LinkColumn(
+                    "証券会社", display_text=r"#([^#]*)$", help="クリックすると、登録したリンク先が開きます"
+                )
+            }
+        st.dataframe(style_table(table, kind), hide_index=True, column_config=config)
+        st.caption(f"⚠ = 前日比が ±{threshold:g}% 以上(通知対象)")
+        render_edit_form(kind, owner, df, broker_names)
+        render_delete_form(kind, owner, df)
+
+    if kind == "holdings" and brokers is not None:
+        render_broker_manager(brokers)
+
+
 def render_settings_tab(owner: str, settings: pd.DataFrame) -> None:
     st.subheader(f"{owner}さんの通知設定")
     row = settings[settings["名義"] == owner].iloc[0]
@@ -371,7 +470,7 @@ def render_settings_tab(owner: str, settings: pd.DataFrame) -> None:
         )
         notify_on = st.checkbox("通知をONにする", value=bool(row["通知ON"]))
         saved = st.form_submit_button("保存")
- 
+
     if saved:
         def modifier(latest: pd.DataFrame) -> pd.DataFrame:
             base = (latest if not latest.empty else default_settings_str()).copy()
@@ -384,7 +483,7 @@ def render_settings_tab(owner: str, settings: pd.DataFrame) -> None:
                 base = pd.concat([base, pd.DataFrame([{"名義": owner, **values}])], ignore_index=True)
             return base[COLUMNS["settings"]]
         apply_and_save("settings", COLUMNS["settings"], modifier, f"{owner}さんの通知設定を保存しました。")
- 
+
     with st.expander("👤 メンバーを追加"):
         with st.form("add_member", clear_on_submit=True):
             new_name = st.text_input("名前(例: 祖母)")
@@ -403,21 +502,21 @@ def render_settings_tab(owner: str, settings: pd.DataFrame) -> None:
                     )
                     return pd.concat([base, add], ignore_index=True)[COLUMNS["settings"]]
                 apply_and_save("settings", COLUMNS["settings"], add_modifier, f"{new_name}さんを追加しました。")
- 
- 
+
+
 # ---------------------------------------------------------
 # メイン
 # ---------------------------------------------------------
 def main() -> None:
     setup_page("株価確認", "📈")  # ページ設定 + ログイン確認(common.py)
     st.title("📈 株価確認")
- 
+
     data = load_all()
     settings = data["settings"]
     owners = list(settings["名義"])
     owner = select_owner(owners)
     threshold = get_threshold(settings, owner)
- 
+
     left, right = st.columns([4, 1])
     left.caption(
         f"最終取得: {datetime.now(ZoneInfo('Asia/Tokyo')):%Y-%m-%d %H:%M:%S} / "
@@ -426,16 +525,16 @@ def main() -> None:
     if right.button("🔄 最新の株価に更新"):
         clear_prices()
         st.rerun()
- 
+
     tab_h, tab_w, tab_s = st.tabs(["保有株", "注目株", "通知設定"])
     with tab_h:
-        render_stock_tab("holdings", owner, rows_of(data["holdings"], owner), threshold)
+        render_stock_tab("holdings", owner, rows_of(data["holdings"], owner), threshold, data["brokers"])
     with tab_w:
         render_stock_tab("watch", owner, rows_of(data["watch"], owner), threshold)
     with tab_s:
         render_settings_tab(owner, settings)
- 
- 
+
+
 if __name__ == "__main__":
     main()
- 
+
