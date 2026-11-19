@@ -1,3 +1,6 @@
+import json
+import re
+import zlib
 from datetime import date
 
 import pandas as pd
@@ -11,15 +14,6 @@ from common import (
     setup_page,
     today_jst,
 )
-from yutai_usage import (
-    clean_amount,
-    fmt_amount,
-    fmt_num,
-    parse_amount,
-    record_all_used,
-    record_manual,
-    record_use,
-)
 
 setup_page("優待管理", "🎁")
 
@@ -27,19 +21,221 @@ setup_page("優待管理", "🎁")
 # 定数
 # ---------------------------------------------------------
 WORKSHEET = None  # スプレッドシート内のシート（タブ）名
+# 最後の「優待明細」が新設列（1社の複数優待をJSONで保持する）。
+# 「優待内容」「カテゴリ」「数量/金額」「有効期限」「ステータス」は
+# 優待明細から自動で作る"要約"として残す（LINE通知など他のプログラム用）。
 COLUMNS = [
     "ID", "銘柄コード", "銘柄名", "名義", "優待内容",
     "カテゴリ", "数量/金額", "権利確定月", "到着日",
-    "有効期限", "ステータス", "メモ",
+    "有効期限", "ステータス", "メモ", "優待明細",
 ]
 STATUS_LIST = ["未到着", "保有中（未使用）", "利用手続き中", "一部利用", "利用完了", "期限切れ"]
 DONE_STATUSES = ("利用完了", "期限切れ")  # 期限アラートの対象外にするステータス
+ACTIVE_PRIORITY = ["利用手続き中", "一部利用", "保有中（未使用）", "未到着"]  # 会社全体のステータス決定用
 OWNERS = ["夫", "妻", "長男", "長女", "その他"]
 CATEGORIES = ["飲食・お食事券", "買い物・割引券", "QUOカード・金券", "カタログギフト", "自社商品", "その他"]
+UNITS = ["円", "枚", "個", "冊", "回", "口", "ポイント", "なし"]
+NO_UNIT = "なし"
+MAX_BENEFITS = 6
+CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩"
+BEN_KEYS = ["内容", "カテゴリ", "数量", "単位", "有効期限", "ステータス"]
+
+today = today_jst()
 
 
 def save(modifier, message):
     apply_and_save(WORKSHEET, COLUMNS, modifier, message)
+
+
+# ---------------------------------------------------------
+# 優待明細（1社に複数の優待）まわりの共通処理
+# ---------------------------------------------------------
+def blank_benefit():
+    return {
+        "内容": "", "カテゴリ": CATEGORIES[0], "数量": "", "単位": "円",
+        "有効期限": "", "ステータス": STATUS_LIST[0], "_new": True,
+    }
+
+
+def num_to_str(n):
+    """数値 → 保存用の文字列（1000.0 → '1000'）。None は空文字。"""
+    if n is None:
+        return ""
+    n = float(n)
+    return str(int(n)) if n.is_integer() else str(round(n, 6))
+
+
+def to_float(s):
+    try:
+        return float(str(s).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def fmt_amount(num_str, unit=""):
+    """'1000','円' → '1,000円'。数値が空なら '未入力'。"""
+    if str(num_str).strip() == "":
+        return "未入力"
+    n = to_float(num_str)
+    if n is None:
+        return f"{num_str}{unit}"
+    body = f"{int(n):,}" if n.is_integer() else f"{n:,g}"
+    return f"{body}{unit}"
+
+
+_LEGACY = re.compile(r"^\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*([^\d\s]*?)\s*分?\s*$")
+
+
+def legacy_to_benefit(row):
+    """旧形式（1社1優待・『3,000円分』のような文字）から優待1件を作る。"""
+    raw = str(row.get("数量/金額", "") or "").strip()
+    num, unit, extra = "", "", ""
+    m = _LEGACY.match(raw)
+    if m:
+        num = num_to_str(float(m.group(1).replace(",", "")))
+        unit = m.group(2)
+    elif raw:
+        extra = raw  # 解析できない文字は優待内容の後ろに残す
+    content = str(row.get("優待内容", "") or "")
+    if extra:
+        content = f"{content}（{extra}）" if content else extra
+    return {
+        "内容": content,
+        "カテゴリ": str(row.get("カテゴリ", "") or "") or CATEGORIES[-1],
+        "数量": num,
+        "単位": unit,
+        "有効期限": str(row.get("有効期限", "") or ""),
+        "ステータス": str(row.get("ステータス", "") or "") or "保有中（未使用）",
+    }
+
+
+def normalize(b):
+    base = blank_benefit()
+    out = {k: str(b.get(k, base[k]) if b.get(k) is not None else "") for k in BEN_KEYS}
+    if not out["ステータス"]:
+        out["ステータス"] = "保有中（未使用）"
+    return out
+
+
+def get_benefits(row):
+    """行から優待のリストを取り出す。優待明細が空なら旧列から自動変換（移行）。"""
+    raw = str(row.get("優待明細", "") or "").strip()
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                items = [normalize(b) for b in data if isinstance(b, dict)]
+                if items:
+                    return items
+        except json.JSONDecodeError:
+            pass
+    return [legacy_to_benefit(row)]
+
+
+def is_active(b):
+    return b["ステータス"] not in DONE_STATUSES
+
+
+def next_expiry(bs):
+    """未完了の優待のうち一番近い期限。全部完了なら一番遅い期限。"""
+    active = [parse_date(b["有効期限"]) for b in bs if is_active(b)]
+    active = [e for e in active if e]
+    if active:
+        return min(active)
+    allx = [parse_date(b["有効期限"]) for b in bs]
+    allx = [e for e in allx if e]
+    return max(allx) if allx else None
+
+
+def summarize(bs):
+    """優待明細から、スプレッドシートの要約列を作る。"""
+    multi = len(bs) > 1
+    contents = [(CIRCLED[i] if multi else "") + b["内容"] for i, b in enumerate(bs)]
+    amounts = [fmt_amount(b["数量"], b["単位"]) for b in bs if b["数量"] != ""]
+    cats = list(dict.fromkeys(b["カテゴリ"] for b in bs if b["カテゴリ"]))
+    active = [b for b in bs if is_active(b)]
+    if active:
+        present = {b["ステータス"] for b in active}
+        status = next((s for s in ACTIVE_PRIORITY if s in present), active[0]["ステータス"])
+    else:
+        status = "利用完了" if any(b["ステータス"] == "利用完了" for b in bs) else "期限切れ"
+    exp = next_expiry(bs)
+    return {
+        "優待内容": " / ".join(contents),
+        "カテゴリ": "・".join(cats),
+        "数量/金額": " / ".join(amounts),
+        "有効期限": str(exp) if exp else "",
+        "ステータス": status,
+    }
+
+
+def set_benefits(d, mask, bs):
+    """DataFrame d の mask 該当行に、優待明細と要約列を書き込む。"""
+    d.loc[mask, "優待明細"] = json.dumps(bs, ensure_ascii=False)
+    for col, v in summarize(bs).items():
+        d.loc[mask, col] = v
+
+
+def with_current(base, current):
+    """既存値が選択肢に無い場合も選べるように追加"""
+    return base + [current] if current and current not in base else base
+
+
+def ben_title(bs, i):
+    return f"優待{CIRCLED[i]}（{bs[i]['内容'] or '内容未入力'}）"
+
+
+# ---------------------------------------------------------
+# 入力欄（登録・編集で共通）
+# ---------------------------------------------------------
+def benefit_inputs(prefix, base):
+    """優待1件ぶんの入力欄を描画して、入力値(dict)を返す。"""
+    is_new = base.get("_new", False)
+    content = st.text_input("優待内容（例: 食事券 / 20%割引券）", value=base["内容"], key=f"{prefix}_content")
+
+    cat_opts = with_current(CATEGORIES, base["カテゴリ"])
+    cat = st.selectbox(
+        "カテゴリ", cat_opts,
+        index=cat_opts.index(base["カテゴリ"]) if base["カテゴリ"] in cat_opts else 0,
+        key=f"{prefix}_cat",
+    )
+
+    col_n, col_u = st.columns([2, 1])
+    with col_n:
+        amount = st.number_input(
+            "数量/金額（数字のみ）", min_value=0.0, value=to_float(base["数量"]),
+            step=1.0, format="%g", key=f"{prefix}_amt",
+        )
+    unit_cur = base["単位"] or NO_UNIT
+    unit_opts = with_current(UNITS, unit_cur)
+    with col_u:
+        unit_sel = st.selectbox("単位", unit_opts, index=unit_opts.index(unit_cur), key=f"{prefix}_unit")
+
+    cur_exp = parse_date(base["有効期限"])
+    no_exp = st.checkbox("有効期限なし", value=(not is_new and cur_exp is None), key=f"{prefix}_noexp")
+    default_exp = date(today.year + 1, 12, 31) if is_new else today
+    exp = st.date_input("有効期限", value=cur_exp or default_exp, key=f"{prefix}_exp")
+
+    status = st.selectbox(
+        "ステータス", STATUS_LIST,
+        index=STATUS_LIST.index(base["ステータス"]) if base["ステータス"] in STATUS_LIST else 0,
+        key=f"{prefix}_status",
+    )
+    return {
+        "内容": content.strip(),
+        "カテゴリ": cat,
+        "数量": num_to_str(amount),
+        "単位": "" if unit_sel == NO_UNIT else unit_sel,
+        "有効期限": "" if no_exp else str(exp),
+        "ステータス": status,
+    }
+
+
+def benefit_tabs(n):
+    """優待が2件以上ならタブ（優待①②…）、1件ならタブなしの入れ物を返す。"""
+    if n > 1:
+        return st.tabs([f"優待{CIRCLED[i]}" for i in range(n)])
+    return [st.container()]
 
 
 # ---------------------------------------------------------
@@ -61,11 +257,13 @@ if not load_ok:
         st.rerun()
     st.stop()
 
-today = today_jst()
+if "優待明細" not in df.columns:
+    df["優待明細"] = ""
+# 画面表示用（スプレッドシートには書かない）: 各社の優待リスト
+df["_b"] = [get_benefits(r) for _, r in df.iterrows()]
 
-# 数量/金額が '5.0' のように小数点付きで読み込まれるので、表示用に '5' へ直す
-if not df.empty:
-    df["数量/金額"] = df["数量/金額"].map(clean_amount)
+# 優待1件ごとの一覧（KPI・期限チェック用）
+all_items = [(r["ID"], i, b) for _, r in df.iterrows() for i, b in enumerate(r["_b"])]
 
 # ---------------------------------------------------------
 # サイドバー
@@ -77,8 +275,9 @@ selected_status = st.sidebar.selectbox("ステータスで絞り込み", ["す�
 owner_values = sorted({o for o in df["名義"] if o.strip()}) if not df.empty else []
 selected_owner = st.sidebar.selectbox("名義で絞り込み", ["すべて"] + owner_values)
 
-# 登録済みのカテゴリ(選択肢にない値が入っていても絞り込めるように追加)
-extra_categories = sorted({c for c in df["カテゴリ"] if c.strip() and c not in CATEGORIES}) if not df.empty else []
+extra_categories = sorted(
+    {b["カテゴリ"] for _, _, b in all_items if b["カテゴリ"].strip() and b["カテゴリ"] not in CATEGORIES}
+)
 selected_category = st.sidebar.selectbox("カテゴリで絞り込み", ["すべて"] + CATEGORIES + extra_categories)
 
 sort_mode = st.sidebar.selectbox("並び順", ["有効期限が近い順", "登録順（ID）"])
@@ -87,56 +286,68 @@ if st.sidebar.button("🔄 スプレッドシートの最新データを再読�
     st.cache_data.clear()
     st.rerun()
 
-# 期限が過ぎているのに「利用完了/期限切れ」になっていないもの
-overdue_ids = []
-if not df.empty:
-    for _, r in df.iterrows():
-        exp = parse_date(r["有効期限"])
-        if exp and exp < today and r["ステータス"] not in DONE_STATUSES:
-            overdue_ids.append(r["ID"])
+# 期限が過ぎているのに「利用完了/期限切れ」になっていない優待
+overdue_count = 0
+for _, _, b in all_items:
+    exp = parse_date(b["有効期限"])
+    if exp and exp < today and is_active(b):
+        overdue_count += 1
 
 st.sidebar.divider()
 if st.sidebar.button(
-    f"⏰ 期限超過を「期限切れ」に更新（{len(overdue_ids)}件）",
-    disabled=not overdue_ids,
+    f"⏰ 期限超過を「期限切れ」に更新（{overdue_count}件）",
+    disabled=not overdue_count,
 ):
     def mark_expired(d):
-        d.loc[d["ID"].isin(overdue_ids), "ステータス"] = "期限切れ"
+        for pos in d.index:
+            bs = get_benefits(d.loc[pos])
+            changed = False
+            for b in bs:
+                exp = parse_date(b["有効期限"])
+                if exp and exp < today and is_active(b):
+                    b["ステータス"] = "期限切れ"
+                    changed = True
+            if changed:
+                set_benefits(d, d.index == pos, bs)
         return d
 
-    save(mark_expired, f"{len(overdue_ids)}件を「期限切れ」に更新しました。")
+    save(mark_expired, f"{overdue_count}件の優待を「期限切れ」に更新しました。")
 
-# フィルタリング
+# フィルタリング（会社単位。条件に合う優待を1つでも持つ会社を表示）
 filtered_df = df.copy()
 if not filtered_df.empty:
-    if selected_status != "すべて":
-        filtered_df = filtered_df[filtered_df["ステータス"] == selected_status]
-    if selected_owner != "すべて":
-        filtered_df = filtered_df[filtered_df["名義"] == selected_owner]
-    if selected_category != "すべて":
-        filtered_df = filtered_df[filtered_df["カテゴリ"] == selected_category]
-    if sort_mode == "有効期限が近い順":
-        sort_key = filtered_df["有効期限"].map(lambda s: parse_date(s) or date.max)
+    def company_matches(r):
+        bs = r["_b"]
+        if selected_status != "すべて" and not any(b["ステータス"] == selected_status for b in bs):
+            return False
+        if selected_category != "すべて" and not any(b["カテゴリ"] == selected_category for b in bs):
+            return False
+        if selected_owner != "すべて" and r["名義"] != selected_owner:
+            return False
+        return True
+
+    filtered_df = filtered_df[filtered_df.apply(company_matches, axis=1)]
+    if sort_mode == "有効期限が近い順" and not filtered_df.empty:
+        sort_key = filtered_df["_b"].map(lambda bs: next_expiry(bs) or date.max)
         filtered_df = (
             filtered_df.assign(_k=sort_key).sort_values("_k", kind="stable").drop(columns="_k")
         )
 
 # ---------------------------------------------------------
-# KPIサマリー
+# KPIサマリー（優待1件ごとに数える）
 # ---------------------------------------------------------
-unused_count = int(df["ステータス"].isin(["未到着", "保有中（未使用）"]).sum()) if not df.empty else 0
-completed_count = int((df["ステータス"] == "利用完了").sum()) if not df.empty else 0
-
+unused_count = sum(1 for _, _, b in all_items if b["ステータス"] in ("未到着", "保有中（未使用）"))
+completed_count = sum(1 for _, _, b in all_items if b["ステータス"] == "利用完了")
 expiring_soon = 0
-for _, r in df.iterrows():
-    if r["ステータス"] in DONE_STATUSES:
-        continue  # 利用完了・期限切れは数えない
-    exp = parse_date(r["有効期限"])
+for _, _, b in all_items:
+    if not is_active(b):
+        continue
+    exp = parse_date(b["有効期限"])
     if exp and 0 <= (exp - today).days <= 30:
         expiring_soon += 1
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("総登録件数", f"{len(df)} 件")
+col1.metric("登録銘柄数", f"{len(df)} 社")
 col2.metric("未使用・到着待ち優待", f"{unused_count} 件")
 col3.metric("⏰ 30日以内に期限切れ", f"{expiring_soon} 件")
 col4.metric("利用完了", f"{completed_count} 件")
@@ -147,9 +358,25 @@ tab1, tab_use, tab2, tab3, tab4 = st.tabs(
     ["📋 優待一覧", "🎫 使用を記録", "➕ 新規登録", "✏️ 編集・削除", "📊 カテゴリ・統計"]
 )
 
+
 # ---------------------------------------------------------
 # TAB 1: 優待一覧
 # ---------------------------------------------------------
+def benefit_html(b):
+    exp = parse_date(b["有効期限"])
+    urgent = exp is not None and is_active(b) and (exp - today).days <= 30
+    exp_color = "#d9534f" if urgent else "inherit"
+    exp_text = esc(b["有効期限"]) if b["有効期限"] else "なし"
+    return f"""
+        <p>🎁 <b>内容:</b> {esc(b['内容'])}</p>
+        <p>🔢 <b>残り:</b> {esc(fmt_amount(b['数量'], b['単位']))}</p>
+        <p>🏷️ <b>カテゴリ:</b> {esc(b['カテゴリ'])}</p>
+        <p>📅 <b>有効期限:</b>
+           <span style="color:{exp_color}; font-weight:bold;">{exp_text}</span></p>
+        <p>📌 <b>ステータス:</b> {esc(b['ステータス'])}</p>
+    """
+
+
 with tab1:
     st.subheader("保有・獲得株主優待 一覧")
     if filtered_df.empty:
@@ -157,122 +384,167 @@ with tab1:
     else:
         view_mode = st.radio("表示モード", ["カード表示", "テーブル表示"], horizontal=True)
         if view_mode == "テーブル表示":
-            st.dataframe(filtered_df)
+            rows = []
+            for _, r in filtered_df.iterrows():
+                bs = r["_b"]
+                for i, b in enumerate(bs):
+                    rows.append({
+                        "銘柄コード": r["銘柄コード"], "銘柄名": r["銘柄名"], "名義": r["名義"],
+                        "優待": f"優待{CIRCLED[i]}" if len(bs) > 1 else "",
+                        "優待内容": b["内容"], "カテゴリ": b["カテゴリ"],
+                        "残り": fmt_amount(b["数量"], b["単位"]),
+                        "有効期限": b["有効期限"], "ステータス": b["ステータス"],
+                        "権利確定月": r["権利確定月"], "到着日": r["到着日"],
+                    })
+            st.dataframe(pd.DataFrame(rows))
         else:
             cols = st.columns(3)
             for idx, row in filtered_df.reset_index(drop=True).iterrows():
-                exp = parse_date(row["有効期限"])
-                is_urgent = (
-                    exp is not None
-                    and row["ステータス"] not in DONE_STATUSES
-                    and (exp - today).days <= 30
-                )
-                exp_color = "#d9534f" if is_urgent else "inherit"
-                exp_text = esc(row["有効期限"]) if row["有効期限"] else "なし"
-                amount_text = esc(row["数量/金額"]) if row["数量/金額"] else "未入力"
+                bs = row["_b"]
                 memo_html = esc(row["メモ"]).replace("\n", "<br>")
                 with cols[idx % 3]:
-                    # 背景は半透明・文字色は継承 → ダークモードでも読める
-                    st.markdown(
-                        f"""
-                        <div style="border:1px solid rgba(128,128,128,0.4); border-radius:10px;
-                                    padding:15px; margin-bottom:15px;
-                                    background-color:rgba(128,128,128,0.08);">
-                            <h4 style="margin-top:0;">[{esc(row['銘柄コード'])}] {esc(row['銘柄名'])}</h4>
-                            <p>👤 <b>名義:</b> {esc(row['名義'])}</p>
-                            <p>🎁 <b>内容:</b> {esc(row['優待内容'])}</p>
-                            <p>🔢 <b>残り:</b> {amount_text}</p>
-                            <p>🏷️ <b>カテゴリ:</b> {esc(row['カテゴリ'])}</p>
-                            <p>📅 <b>有効期限:</b>
-                               <span style="color:{exp_color}; font-weight:bold;">{exp_text}</span></p>
-                            <p>📌 <b>ステータス:</b> {esc(row['ステータス'])}</p>
-                            <p>📝 <i>{memo_html}</i></p>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+                    with st.container(border=True):
+                        st.markdown(
+                            f"<h4 style='margin-top:0;'>[{esc(row['銘柄コード'])}] {esc(row['銘柄名'])}</h4>"
+                            f"<p>👤 <b>名義:</b> {esc(row['名義'])}</p>",
+                            unsafe_allow_html=True,
+                        )
+                        if len(bs) > 1:
+                            for t, b in zip(st.tabs([f"優待{CIRCLED[i]}" for i in range(len(bs))]), bs):
+                                with t:
+                                    st.markdown(benefit_html(b), unsafe_allow_html=True)
+                        else:
+                            st.markdown(benefit_html(bs[0]), unsafe_allow_html=True)
+                        if memo_html:
+                            st.markdown(f"<p>📝 <i>{memo_html}</i></p>", unsafe_allow_html=True)
 
 # ---------------------------------------------------------
-# TAB: 使用を記録（一部だけ使ったときの、使用数と残りの更新）
+# TAB: 使用を記録
 # ---------------------------------------------------------
+def record_usage(target_id, bi, new_num=None):
+    """new_num: 使用後の残り(数値)。None または 0 以下なら「全部使った」。"""
+    def modifier(d):
+        mask = d["ID"] == target_id
+        if not mask.any():
+            raise ValueError("対象のデータが見つかりません（他の方が削除した可能性があります）。")
+        row = d[mask].iloc[0]
+        bs = get_benefits(row)
+        if bi >= len(bs):
+            raise ValueError("対象の優待が見つかりません。編集された可能性があります。再読み込みしてください。")
+        b = bs[bi]
+        title = ben_title(bs, bi)
+        old_txt = fmt_amount(b["数量"], b["単位"])
+        if new_num is None or new_num <= 0:
+            if b["数量"] != "":
+                b["数量"] = "0"
+            b["ステータス"] = "利用完了"
+            log = f"{today} {title}: 全部使用（残り {old_txt} → 利用完了）"
+        else:
+            b["数量"] = num_to_str(new_num)
+            b["ステータス"] = "一部利用"
+            log = f"{today} {title}: 残り {old_txt} → {fmt_amount(b['数量'], b['単位'])}"
+        memo = str(row["メモ"]).rstrip()
+        d.loc[mask, "メモ"] = (memo + "\n" if memo else "") + "[使用] " + log
+        set_benefits(d, mask, bs)
+        return d
+
+    return modifier
+
+
 with tab_use:
     st.subheader("🎫 優待の使用を記録")
-    st.caption("食事券など一度に使い切らない優待の「使った数」と「残り」を更新します。履歴はメモに残ります。")
+    st.caption("食事券など一度に使い切らない優待の「残り」を更新します。履歴はメモに残ります。")
 
-    usable = df[~df["ステータス"].isin(("未到着",) + DONE_STATUSES)] if not df.empty else df
-    if usable.empty:
+    options = []
+    for _, r in df.iterrows():
+        bs = r["_b"]
+        for i, b in enumerate(bs):
+            if b["ステータス"] == "未到着" or not is_active(b):
+                continue
+            gift = b["内容"][:15] + ("…" if len(b["内容"]) > 15 else "")
+            mark = CIRCLED[i] if len(bs) > 1 else ""
+            label = (
+                f"{r['銘柄名']} {mark}{gift}｜残り {fmt_amount(b['数量'], b['単位'])}"
+                f"｜期限 {b['有効期限'] or 'なし'}｜{r['名義']}"
+            )
+            options.append((parse_date(b["有効期限"]) or date.max, f"{r['ID']}|{i}", label))
+
+    if not options:
         st.info("使用を記録できる優待がありません（「未到着」「利用完了」「期限切れ」は対象外です）。")
     else:
-        usable = usable.assign(
-            _k=usable["有効期限"].map(lambda s: parse_date(s) or date.max)
-        ).sort_values("_k", kind="stable")
-
-        labels = {}
-        for _, r in usable.iterrows():
-            gift = r["優待内容"][:15] + ("…" if len(r["優待内容"]) > 15 else "")
-            labels[r["ID"]] = (
-                f"{r['銘柄名']} {gift}｜残り {r['数量/金額'] or '未入力'}"
-                f"｜期限 {r['有効期限'] or 'なし'}｜{r['名義']}"
-            )
-        use_ids = list(labels)
-        saved_id = st.session_state.get("use_target_id")
-        use_id = st.selectbox(
+        options.sort(key=lambda x: x[0])
+        labels = {k: lab for _, k, lab in options}
+        use_keys = list(labels)
+        saved = st.session_state.get("use_target_key")
+        use_key = st.selectbox(
             "使った優待を選択（期限が近い順）",
-            use_ids,
-            index=use_ids.index(saved_id) if saved_id in use_ids else 0,
+            use_keys,
+            index=use_keys.index(saved) if saved in use_keys else 0,
             format_func=labels.get,
         )
-        st.session_state["use_target_id"] = use_id
+        st.session_state["use_target_key"] = use_key
 
-        use_row = usable[usable["ID"] == use_id].iloc[0]
-        parsed = parse_amount(use_row["数量/金額"])
-        st.markdown(f"**現在の残り:** {use_row['数量/金額'] or '未入力'}")
+        use_id, use_bi = use_key.split("|")
+        use_bi = int(use_bi)
+        use_row = df[df["ID"] == use_id].iloc[0]
+        b = use_row["_b"][use_bi]
+        unit = b["単位"]
+        cur = to_float(b["数量"]) if b["数量"] != "" else None
+        st.markdown(f"**現在の残り:** {fmt_amount(b['数量'], unit)}")
 
         def all_used_button():
-            if st.button("🍽️ 全部使った（利用完了にする）", key=f"use_all_{use_id}"):
-                save(record_all_used(use_id, today), f"{use_row['銘柄名']}を「利用完了」にしました。")
+            if st.button("🍽️ 全部使った（利用完了にする）", key=f"use_all_{use_key}"):
+                save(record_usage(use_id, use_bi, None), f"{use_row['銘柄名']}を「利用完了」にしました。")
 
-        if parsed:
-            unit = parsed["unit"]
-            used = st.number_input(
-                "使った数" + (f"（{unit}）" if unit else ""),
-                min_value=0.0, value=1.0, step=1.0, format="%g", key=f"use_n_{use_id}",
-            )
-            remaining = round(parsed["num"] - used, 6)
-            can_record = used > 0 and remaining >= 0
-            if used <= 0:
-                st.info("使った数を入力してください。")
-            elif remaining < 0:
-                st.error(f"残り（{fmt_amount(parsed)}）より多くは使えません。")
+        if cur is not None:
+            kk = f"{use_key}_{b['数量']}"  # 残りが変わったら入力欄も初期化されるようキーに含める
+            step = 100.0 if unit == "円" else 1.0
+            suffix = f"（{unit}）" if unit else ""
+            mode = st.radio("入力方法", ["使った分を入力", "残りを直接入力"], horizontal=True, key=f"use_mode_{kk}")
+
+            new_num, can_record = None, False
+            if mode == "使った分を入力":
+                used = st.number_input(
+                    f"使った分{suffix}", min_value=0.0, value=0.0, step=step, format="%g", key=f"use_n_{kk}"
+                )
+                if used <= 0:
+                    st.info("使った分を入力してください。")
+                elif used > cur:
+                    st.error(f"残り（{fmt_amount(b['数量'], unit)}）より多くは使えません。")
+                else:
+                    new_num, can_record = round(cur - used, 6), True
             else:
-                finish_note = "（使い切り → 「利用完了」になります）" if remaining == 0 else ""
-                st.success(f"残り: {fmt_amount(parsed)} → **{fmt_amount({**parsed, 'num': remaining})}** {finish_note}")
+                remain = st.number_input(
+                    f"新しい残り{suffix}", min_value=0.0, value=cur, step=step, format="%g", key=f"use_r_{kk}"
+                )
+                if remain == cur:
+                    st.info("残りが現在と同じです。")
+                else:
+                    new_num, can_record = round(remain, 6), True
+                    if remain > cur:
+                        st.warning("残りが増えています（訂正として記録されます）。")
+
+            if can_record:
+                finish_note = "（使い切り → 「利用完了」になります）" if new_num <= 0 else ""
+                st.success(
+                    f"残り: {fmt_amount(b['数量'], unit)} → **{fmt_amount(num_to_str(new_num), unit)}** {finish_note}"
+                )
 
             col_u1, col_u2 = st.columns(2)
             with col_u1:
-                if st.button("✅ 使用を記録する", key=f"use_btn_{use_id}", type="primary", disabled=not can_record):
+                if st.button("✅ 使用を記録する", key=f"use_btn_{kk}", type="primary", disabled=not can_record):
                     save(
-                        record_use(use_id, used, today),
-                        f"{use_row['銘柄名']}：{fmt_num(used, parsed['comma'])}{unit} の使用を記録しました。",
+                        record_usage(use_id, use_bi, new_num),
+                        f"{use_row['銘柄名']}：残りを {fmt_amount(num_to_str(new_num), unit)} に更新しました。",
                     )
             with col_u2:
                 all_used_button()
         else:
             st.info(
-                "「数量/金額」が「数字+単位」（例: 3000円分、5枚）の形ではないため、自動では計算できません。"
-                "残りを手で入力してください。"
+                "この優待は「数量/金額」が未入力のため、残りの計算ができません。"
+                "「編集・削除」タブで数量を入力すると、一部使用も記録できます。"
             )
-            new_remaining = st.text_input("新しい残り（数量/金額）", value=use_row["数量/金額"], key=f"use_manual_{use_id}")
-            note = st.text_input("メモに残す一言（任意）", key=f"use_note_{use_id}")
-            col_u1, col_u2 = st.columns(2)
-            with col_u1:
-                if st.button("✅ 残りを更新する（一部利用）", key=f"use_btn_{use_id}", type="primary"):
-                    save(
-                        record_manual(use_id, new_remaining, today, note),
-                        f"{use_row['銘柄名']}の残りを更新しました。",
-                    )
-            with col_u2:
-                all_used_button()
+            all_used_button()
 
 # ---------------------------------------------------------
 # TAB 2: 新規登録
@@ -280,23 +552,30 @@ with tab_use:
 with tab2:
     st.subheader("新しい株主優待情報を登録")
     # 登録成功時にバージョンを進めて、フォームを空にする（失敗時は入力内容を残す）
-    form_ver = st.session_state.get("yutai_add_form_ver", 0)
-    with st.form(f"yutai_add_form_{form_ver}"):
+    ver = st.session_state.get("yutai_add_form_ver", 0)
+
+    n_add = int(st.number_input(
+        "この会社の優待内容の数（金券と割引券など複数あるとき増やす）",
+        min_value=1, max_value=MAX_BENEFITS, value=1, step=1, key=f"add_n_{ver}",
+    ))
+
+    with st.form(f"yutai_add_form_{ver}"):
+        st.markdown("##### 🏢 会社情報")
         col_a, col_b = st.columns(2)
         with col_a:
-            code = st.text_input("銘柄コード (例: 7550)")
-            name = st.text_input("銘柄名 (例: ゼンショーHD) ※必須")
-            owner = st.selectbox("名義", OWNERS)
-            category = st.selectbox("カテゴリ", CATEGORIES)
-            value = st.text_input("数量/金額 (例: 3,000円分)")
+            code = st.text_input("銘柄コード (例: 7550)", key=f"add_code_{ver}")
+            name = st.text_input("銘柄名 (例: ゼンショーHD) ※必須", key=f"add_name_{ver}")
+            owner = st.selectbox("名義", OWNERS, key=f"add_owner_{ver}")
         with col_b:
-            rights_month = st.text_input("権利確定月 (例: 3月/9月)")
-            arrival_date = st.date_input("到着日 / 到着予定日", value=today)
-            no_expiry = st.checkbox("有効期限なし")
-            expiry_date = st.date_input("有効期限", value=date(today.year + 1, 12, 31))
-            status = st.selectbox("ステータス", STATUS_LIST)
-            memo = st.text_area("メモ・使い道など")
-            gift_detail = st.text_input("優待内容詳細 (例: 食事優待券 500円×6枚)")
+            rights_month = st.text_input("権利確定月 (例: 3月/9月)", key=f"add_rm_{ver}")
+            arrival_date = st.date_input("到着日 / 到着予定日", value=today, key=f"add_arr_{ver}")
+            memo = st.text_area("メモ・使い道など", key=f"add_memo_{ver}")
+
+        st.markdown("##### 🎁 優待内容")
+        new_bens = []
+        for i, t in enumerate(benefit_tabs(n_add)):
+            with t:
+                new_bens.append(benefit_inputs(f"add_{ver}_{i}", blank_benefit()))
 
         submit_btn = st.form_submit_button("優待情報を追加する")
 
@@ -312,18 +591,15 @@ with tab2:
                     "銘柄コード": code.strip(),
                     "銘柄名": name.strip(),
                     "名義": owner,
-                    "優待内容": gift_detail,
-                    "カテゴリ": category,
-                    "数量/金額": value,
                     "権利確定月": rights_month,
                     "到着日": str(arrival_date),
-                    "有効期限": "" if no_expiry else str(expiry_date),
-                    "ステータス": status,
                     "メモ": memo,
+                    "優待明細": json.dumps(new_bens, ensure_ascii=False),
+                    **summarize(new_bens),
                 }
                 return pd.concat([d, pd.DataFrame([new_row])], ignore_index=True)
 
-            st.session_state["yutai_add_form_ver"] = form_ver + 1
+            st.session_state["yutai_add_form_ver"] = ver + 1
             save(add_row, "優待情報を追加し、Googleスプレッドシートに同期しました！")
 
 # ---------------------------------------------------------
@@ -334,45 +610,51 @@ with tab3:
     if df.empty:
         st.info("編集対象のデータがありません。")
     else:
-        options = {
+        edit_options = {
             f"{r['ID']} : [{r['銘柄コード']}] {r['銘柄名']} ({r['名義']})": r["ID"]
             for _, r in df.iterrows()
         }
-        selected_label = st.selectbox("編集・削除する優待を選択", list(options.keys()))
-        target_id = options[selected_label]
+        selected_label = st.selectbox("編集・削除する優待を選択", list(edit_options.keys()))
+        target_id = edit_options[selected_label]
         target_row = df[df["ID"] == target_id].iloc[0]
+        cur_bens = target_row["_b"]
 
-        def with_current(base, current):
-            """既存値が選択肢に無い場合も選べるように追加"""
-            return base + [current] if current and current not in base else base
+        # 選択の切り替え・保存後の内容変更で入力欄が正しく更新されるよう、内容のハッシュをキーに含める
+        sig = "|".join(str(target_row.get(c, "")) for c in COLUMNS)
+        k = f"{target_id}_{zlib.crc32(sig.encode('utf-8'))}"
 
-        owner_opts = with_current(OWNERS, target_row["名義"])
-        category_opts = with_current(CATEGORIES, target_row["カテゴリ"])
-        cur_owner_idx = owner_opts.index(target_row["名義"]) if target_row["名義"] in owner_opts else 0
-        cur_cat_idx = category_opts.index(target_row["カテゴリ"]) if target_row["カテゴリ"] in category_opts else 0
-        cur_status_idx = (
-            STATUS_LIST.index(target_row["ステータス"]) if target_row["ステータス"] in STATUS_LIST else 1
-        )
-        cur_arrival = parse_date(target_row["到着日"])
-        cur_expiry = parse_date(target_row["有効期限"])
+        n_edit = int(st.number_input(
+            "優待内容の数（増やすと空の優待が追加されます）",
+            min_value=1, max_value=MAX_BENEFITS, value=len(cur_bens), step=1, key=f"e_n_{k}",
+        ))
+        if n_edit < len(cur_bens):
+            st.warning(f"保存すると、優待{CIRCLED[n_edit]}以降が削除されます。")
 
-        k = target_id  # 選択を切り替えたときに入力欄が正しく更新されるようキーに含める
         with st.form("yutai_edit_form"):
+            st.markdown("##### 🏢 会社情報")
             col_ea, col_eb = st.columns(2)
+            owner_opts = with_current(OWNERS, target_row["名義"])
             with col_ea:
                 e_code = st.text_input("銘柄コード", value=target_row["銘柄コード"], key=f"e_code_{k}")
                 e_name = st.text_input("銘柄名", value=target_row["銘柄名"], key=f"e_name_{k}")
-                e_owner = st.selectbox("名義", owner_opts, index=cur_owner_idx, key=f"e_owner_{k}")
-                e_category = st.selectbox("カテゴリ", category_opts, index=cur_cat_idx, key=f"e_cat_{k}")
-                e_value = st.text_input("数量/金額", value=target_row["数量/金額"], key=f"e_val_{k}")
+                e_owner = st.selectbox(
+                    "名義", owner_opts,
+                    index=owner_opts.index(target_row["名義"]) if target_row["名義"] in owner_opts else 0,
+                    key=f"e_owner_{k}",
+                )
             with col_eb:
                 e_rights_month = st.text_input("権利確定月", value=target_row["権利確定月"], key=f"e_rm_{k}")
-                e_arrival_date = st.date_input("到着日", value=cur_arrival or today, key=f"e_arr_{k}")
-                e_no_expiry = st.checkbox("有効期限なし", value=cur_expiry is None, key=f"e_noexp_{k}")
-                e_expiry_date = st.date_input("有効期限", value=cur_expiry or today, key=f"e_exp_{k}")
-                e_status = st.selectbox("ステータス", STATUS_LIST, index=cur_status_idx, key=f"e_st_{k}")
+                e_arrival_date = st.date_input(
+                    "到着日", value=parse_date(target_row["到着日"]) or today, key=f"e_arr_{k}"
+                )
                 e_memo = st.text_area("メモ", value=target_row["メモ"], key=f"e_memo_{k}")
-                e_gift_detail = st.text_input("優待内容詳細", value=target_row["優待内容"], key=f"e_gift_{k}")
+
+            st.markdown("##### 🎁 優待内容")
+            e_bens = []
+            for i, t in enumerate(benefit_tabs(n_edit)):
+                with t:
+                    base = cur_bens[i] if i < len(cur_bens) else blank_benefit()
+                    e_bens.append(benefit_inputs(f"e_{k}_{i}", base))
 
             confirm_delete = st.checkbox("削除する場合はここにチェック（元に戻せません）", key=f"e_del_{k}")
 
@@ -383,26 +665,22 @@ with tab3:
                 delete_btn = st.form_submit_button("🗑️ データを削除", type="primary")
 
         if update_btn:
-            new_values = {
+            new_company = {
                 "銘柄コード": e_code.strip(),
                 "銘柄名": e_name.strip(),
                 "名義": e_owner,
-                "優待内容": e_gift_detail,
-                "カテゴリ": e_category,
-                "数量/金額": e_value,
                 "権利確定月": e_rights_month,
                 "到着日": str(e_arrival_date),
-                "有効期限": "" if e_no_expiry else str(e_expiry_date),
-                "ステータス": e_status,
                 "メモ": e_memo,
             }
 
             def update_row(d):
-                idx = d.index[d["ID"] == target_id]
-                if len(idx) == 0:
+                mask = d["ID"] == target_id
+                if not mask.any():
                     raise ValueError("対象のデータが見つかりません（他の方が削除した可能性があります）。")
-                for col_name, v in new_values.items():
-                    d.loc[idx, col_name] = v
+                for col_name, v in new_company.items():
+                    d.loc[mask, col_name] = v
+                set_benefits(d, mask, e_bens)
                 return d
 
             save(update_row, "変更を保存し、Googleスプレッドシートに同期しました！")
@@ -428,17 +706,17 @@ with tab4:
     else:
         col_g1, col_g2, col_g3 = st.columns(3)
         with col_g1:
-            st.write("▼ カテゴリ別 件数")
-            s = df.loc[df["カテゴリ"].str.strip() != "", "カテゴリ"].value_counts()
+            st.write("▼ カテゴリ別 件数（優待ごと）")
+            s = pd.Series([b["カテゴリ"] for _, _, b in all_items if b["カテゴリ"].strip()]).value_counts()
             if not s.empty:
                 st.bar_chart(s)
         with col_g2:
-            st.write("▼ 名義別 件数")
+            st.write("▼ 名義別 銘柄数")
             s = df.loc[df["名義"].str.strip() != "", "名義"].value_counts()
             if not s.empty:
                 st.bar_chart(s)
         with col_g3:
-            st.write("▼ ステータス別 件数")
-            s = df.loc[df["ステータス"].str.strip() != "", "ステータス"].value_counts()
+            st.write("▼ ステータス別 件数（優待ごと）")
+            s = pd.Series([b["ステータス"] for _, _, b in all_items if b["ステータス"].strip()]).value_counts()
             if not s.empty:
                 st.bar_chart(s)
