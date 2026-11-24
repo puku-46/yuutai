@@ -368,9 +368,13 @@ def benefit_line_html(b, mark=""):
     exp_color = "#d9534f" if urgent else "inherit"
     exp_text = esc(b["有効期限"]) if b["有効期限"] else "期限なし"
     content = esc(b["内容"]) or "（内容未入力）"
+    cat = esc(b["カテゴリ"])
+    cat_html = (
+        f'<span style="font-size:0.8em; opacity:0.7;">　🏷️ {cat}</span>' if cat else ""
+    )
     return (
         '<div style="padding:6px 0; border-top:1px solid rgba(128,128,128,0.25);">'
-        f"<div><b>{mark}{content}</b></div>"
+        f"<div><b>{mark}{content}</b>{cat_html}</div>"
         '<div style="font-size:0.9em;">'
         f"🔢 残り <b>{esc(fmt_amount(b['数量'], b['単位']))}</b>　"
         f'📅 <span style="color:{exp_color}; font-weight:bold;">{exp_text}</span>　'
