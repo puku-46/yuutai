@@ -411,12 +411,12 @@ with tab1:
                             f"<p>👤 <b>名義:</b> {esc(row['名義'])}</p>",
                             unsafe_allow_html=True,
                         )
-                        if len(bs) > 1:
-                            for t, b in zip(st.tabs([f"優待{CIRCLED[i]}" for i in range(len(bs))]), bs):
-                                with t:
-                                    st.markdown(benefit_html(b), unsafe_allow_html=True)
-                        else:
-                            st.markdown(benefit_html(bs[0]), unsafe_allow_html=True)
+                        lines = "".join(
+                        benefit_line_html(b, f"{CIRCLED[i]} " if len(bs) > 1 else "")
+                        for i, b in enumerate(bs)
+                        )
+                        st.markdown(lines, unsafe_allow_html=True)
+                        
                         if memo_html:
                             st.markdown(f"<p>📝 <i>{memo_html}</i></p>", unsafe_allow_html=True)
 
