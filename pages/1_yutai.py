@@ -362,19 +362,21 @@ tab1, tab_use, tab2, tab3, tab4 = st.tabs(
 # ---------------------------------------------------------
 # TAB 1: 優待一覧
 # ---------------------------------------------------------
-def benefit_html(b):
+def benefit_line_html(b, mark=""):
     exp = parse_date(b["有効期限"])
     urgent = exp is not None and is_active(b) and (exp - today).days <= 30
     exp_color = "#d9534f" if urgent else "inherit"
-    exp_text = esc(b["有効期限"]) if b["有効期限"] else "なし"
-    return f"""
-        <p>🎁 <b>内容:</b> {esc(b['内容'])}</p>
-        <p>🔢 <b>残り:</b> {esc(fmt_amount(b['数量'], b['単位']))}</p>
-        <p>🏷️ <b>カテゴリ:</b> {esc(b['カテゴリ'])}</p>
-        <p>📅 <b>有効期限:</b>
-           <span style="color:{exp_color}; font-weight:bold;">{exp_text}</span></p>
-        <p>📌 <b>ステータス:</b> {esc(b['ステータス'])}</p>
-    """
+    exp_text = esc(b["有効期限"]) if b["有効期限"] else "期限なし"
+    content = esc(b["内容"]) or "（内容未入力）"
+    return (
+        '<div style="padding:6px 0; border-top:1px solid rgba(128,128,128,0.25);">'
+        f"<div><b>{mark}{content}</b></div>"
+        '<div style="font-size:0.9em;">'
+        f"🔢 残り <b>{esc(fmt_amount(b['数量'], b['単位']))}</b>　"
+        f'📅 <span style="color:{exp_color}; font-weight:bold;">{exp_text}</span>　'
+        f"📌 {esc(b['ステータス'])}"
+        "</div></div>"
+    )
 
 
 with tab1:
