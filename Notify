@@ -5,6 +5,12 @@
   2. 名義ごとに、前日比がしきい値(%)以上の銘柄を抽出(上昇・下落どちらも)
   3. 該当があった名義にだけ、1通にまとめて Make(Webhook) 経由でLINE送信
 
+米国株(BDX など、.T が付かないコード)の扱い:
+  ・通知するのは「前場引け」の回だけ(1日1回)。後場引けの通知には入れない。
+  ・日本の前場引け(11:30ごろ)の時点では米国市場は閉まっているので、米国株は「前日の米国終値」ベース。
+    前日比(%)はドル建て。表示の価格は、その時点のドル円レートで円に換算し、( )内にドル建ての値段を添える。
+  ・米国が休場だった翌日などで、データが古い(前回の通知と同じ動きになってしまう)場合は入れない。
+
 使い方:
   python notify.py --dry-run          # 送信せず、内容を画面に表示(まずこれで確認)
   python notify.py --dry-run --force  # 休場日・時間外でも判定する(テスト用)
@@ -28,6 +34,8 @@ JST = ZoneInfo("Asia/Tokyo")
 
 DEFAULT_MEMBERS = ["夫", "妻", "長男", "長女", "その他"]  # ページ2(2_stocks.py)と同じ
 DEFAULT_THRESHOLD = 3.0
+FX_CODE = "USDJPY=X"  # ドル円レート(円換算に使う)
+US_SESSION = "前場引け"  # 米国株を通知に入れる回
 COLUMNS = {
     "holdings": ["名義", "銘柄コード", "銘柄名", "取得単価", "株数"],
     "watch": ["名義", "銘柄コード", "銘柄名", "目標価格"],
@@ -73,13 +81,17 @@ def read_tab(ss, kind: str) -> pd.DataFrame:
 # 株価取得・休場判定
 # ------------------------------------------------------------
 def fetch_prices(codes) -> dict:
-    """銘柄コード -> {'last': 現在値, 'prev': 前日終値}。取得できない銘柄は含めない。"""
+    """銘柄コード -> {'last': 現在値, 'prev': 前日終値, 'date': 最新の足の日付}。取得できない銘柄は含めない。"""
     prices = {}
     for code in sorted(set(codes)):
         try:
             closes = yf.Ticker(code).history(period="5d")["Close"].dropna()
             if len(closes) >= 2:
-                prices[code] = {"last": float(closes.iloc[-1]), "prev": float(closes.iloc[-2])}
+                prices[code] = {
+                    "last": float(closes.iloc[-1]),
+                    "prev": float(closes.iloc[-2]),
+                    "date": closes.index[-1].date(),
+                }
         except Exception as e:  # 1銘柄の失敗で全体を止めない
             print(f"[警告] {code} の株価を取得できませんでした: {e}", file=sys.stderr)
     return prices
@@ -98,32 +110,70 @@ def fmt_price(v: float) -> str:
     return f"{v:,.1f}".rstrip("0").rstrip(".")
 
 
-def collect_alerts(df: pd.DataFrame, kind: str, threshold: float, prices: dict) -> list:
+def currency_of(code: str) -> str:
+    """日本株(.T)=円 / .T以外でドットなし=米国株=USD / それ以外は未対応('?')"""
+    if code.endswith(".T"):
+        return "円"
+    if "." not in code:
+        return "USD"
+    return "?"
+
+
+def us_data_is_fresh(bar_date, now) -> bool:
+    """米国株の最新の足が『直前の米国取引日』のものか。
+    火〜金の朝なら前日、月曜の朝なら金曜の足が正常。米国の休場日の翌日などで古いデータなら False。"""
+    if bar_date is None:
+        return False
+    days = (now.date() - bar_date).days
+    return 0 <= days <= (3 if now.weekday() == 0 else 1)
+
+
+def collect_alerts(df: pd.DataFrame, kind: str, threshold: float, prices: dict, now, session: str) -> list:
     alerts = []
+    rate = (prices.get(FX_CODE) or {}).get("last")
     for _, r in df.iterrows():
-        p = prices.get(r["銘柄コード"])
+        code = r["銘柄コード"]
+        p = prices.get(code)
         if not p or not p["prev"]:
+            continue
+        cur = currency_of(code)
+        if cur == "USD":
+            # 米国株: 前場引けの回だけ。為替が取れない・データが古い場合は入れない
+            if session != US_SESSION or not rate or not us_data_is_fresh(p.get("date"), now):
+                continue
+        elif cur != "円":
             continue
         pct = (p["last"] - p["prev"]) / p["prev"] * 100
         if abs(pct) >= threshold:
-            alerts.append((kind, r["銘柄名"], r["銘柄コード"], p["last"], pct))
+            alerts.append((kind, r["銘柄名"], code, p["last"], pct, cur))
     return alerts
+
+
+def format_line(alert: tuple, rate) -> str:
+    kind, name, code, last, pct, cur = alert
+    if cur == "USD":
+        price = f"{fmt_price(last * rate)}円({last:,.2f}ドル)"  # 円換算 + ドル建ての値段
+    else:
+        price = f"{fmt_price(last)}円"
+    return f"【{KIND_LABEL[kind]}】{name}({code.removesuffix('.T')}) {price} {pct:+.1f}%"
 
 
 def build_messages(session: str, holdings, watch, settings, prices: dict, now=None) -> dict:
     """名義 -> 送信メッセージ。該当銘柄がない名義・通知OFFの名義は含めない。"""
     now = now or datetime.now(JST)
+    rate = (prices.get(FX_CODE) or {}).get("last")
     messages = {}
     for _, s in settings[settings["通知ON"]].iterrows():
         owner, threshold = s["名義"], float(s["しきい値(%)"])
-        alerts = collect_alerts(holdings[holdings["名義"] == owner], "holdings", threshold, prices)
-        alerts += collect_alerts(watch[watch["名義"] == owner], "watch", threshold, prices)
+        alerts = collect_alerts(holdings[holdings["名義"] == owner], "holdings", threshold, prices, now, session)
+        alerts += collect_alerts(watch[watch["名義"] == owner], "watch", threshold, prices, now, session)
         if not alerts:
             continue
         alerts.sort(key=lambda a: abs(a[4]), reverse=True)  # 動きが大きい順
         lines = [f"📈 株価アラート {now:%m/%d} {session}(前日比±{threshold:g}%以上)"]
-        for kind, name, code, last, pct in alerts:
-            lines.append(f"【{KIND_LABEL[kind]}】{name}({code.removesuffix('.T')}) {fmt_price(last)}円 {pct:+.1f}%")
+        lines += [format_line(a, rate) for a in alerts]
+        if any(a[5] == "USD" for a in alerts):
+            lines.append(f"※米国株は前日の米国終値。前日比はドル建て、円換算は{rate:,.2f}円/ドル")
         messages[owner] = "\n".join(lines)
     return messages
 
@@ -153,7 +203,11 @@ def main(argv=None) -> int:
     active = set(settings.loc[settings["通知ON"], "名義"])
     codes = list(holdings.loc[holdings["名義"].isin(active), "銘柄コード"])
     codes += list(watch.loc[watch["名義"].isin(active), "銘柄コード"])
+    if session == US_SESSION and any(currency_of(c) == "USD" for c in codes):
+        codes.append(FX_CODE)  # 米国株を円換算するためのドル円レート
     prices = fetch_prices(codes)
+    if session == US_SESSION and FX_CODE not in prices and any(currency_of(c) == "USD" for c in codes):
+        print("[警告] ドル円レートを取得できなかったため、米国株は通知に含めません。", file=sys.stderr)
 
     messages = build_messages(session, holdings, watch, settings, prices, now)
     if not messages:
@@ -176,4 +230,3 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
