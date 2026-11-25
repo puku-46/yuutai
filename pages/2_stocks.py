@@ -44,6 +44,7 @@ DEFAULT_MEMBERS = ["夫", "妻", "長男", "長女", "その他"]  # ページ1�
 DEFAULT_THRESHOLD = 3.0  # 前日比 ±% の初期値
 FX_USDJPY = "USDJPY=X"  # ドル円レートの取得に使う
 JST = ZoneInfo("Asia/Tokyo")
+ALL = "全員"  # 名義の選択肢。家族全員の一覧(閲覧専用)
 
 COLUMNS = {
     "holdings": ["名義", "銘柄コード", "銘柄名", "取得単価", "株数", "証券会社", "取得日"],
@@ -413,7 +414,7 @@ def render_summary(table: pd.DataFrame) -> None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("評価額 合計(円)", f"{total:,.0f} 円")
     c2.metric("含み損益 合計(円)", f"{pnl:+,.0f} 円", f"{pnl / cost * 100:+.2f}%" if cost else None)
-    c3.metric("銘柄数", f"{len(table)} 銘柄")
+    c3.metric("銘柄数", f"{table['銘柄コード'].nunique()} 銘柄")
     c4.metric("しきい値超え", f"{alerts} 銘柄")
     if (table["通貨"] == "USD").any():
         fx = table["為替込み損益"]
@@ -628,6 +629,101 @@ def render_stock_tab(kind: str, owner: str, df: pd.DataFrame, threshold: float, 
         render_broker_manager(brokers)
 
 
+def color_pn(v):
+    if pd.isna(v):
+        return ""
+    return "color: #d62728" if v < 0 else "color: #2ca02c" if v > 0 else ""
+
+
+def build_all_table(kind: str, data: dict, owners: list, broker_urls: dict = None) -> pd.DataFrame:
+    """全員分の表。名義ごとに、その人のしきい値で通知(⚠)を判定してから1つにまとめる"""
+    parts = []
+    for o in owners:
+        d = rows_of(data[kind], o)
+        if d.empty:
+            continue
+        t = build_table(kind, d, get_threshold(data["settings"], o), broker_urls)
+        t.insert(0, "名義", o)
+        parts.append(t)
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
+def owner_summary(table: pd.DataFrame) -> pd.DataFrame:
+    """名義別の合計(円換算)。計算できる銘柄がなければ空欄('-')"""
+    g = table.groupby("名義", sort=False).agg(
+        銘柄数=("銘柄コード", "nunique"),
+        評価額=("評価額", lambda s: s.sum(min_count=1)),
+        含み損益=("含み損益", lambda s: s.sum(min_count=1)),
+        為替込み損益=("為替込み損益", lambda s: s.sum(min_count=1)),
+    )
+    return g.reset_index()
+
+
+def stock_summary(table: pd.DataFrame) -> pd.DataFrame:
+    """同じ銘柄を複数人が持っている場合も合算した、銘柄ごとの合計(円換算)"""
+    g = table.groupby(["銘柄コード", "銘柄名"], sort=False).agg(
+        保有者=("名義", lambda s: "・".join(s)),
+        株数=("株数", "sum"),
+        評価額=("評価額", lambda s: s.sum(min_count=1)),
+        含み損益=("含み損益", lambda s: s.sum(min_count=1)),
+    )
+    return g.reset_index().sort_values("評価額", ascending=False, na_position="last")
+
+
+def style_sum(df: pd.DataFrame):
+    fmt = {c: "{:,.0f}" for c in ["評価額", "株数"] if c in df}
+    fmt.update({c: "{:+,.0f}" for c in ["含み損益", "為替込み損益"] if c in df})
+    styler = df.style.format(fmt, na_rep="-")
+    apply_color = getattr(styler, "map", None) or styler.applymap
+    return apply_color(color_pn, subset=[c for c in ["含み損益", "為替込み損益"] if c in df])
+
+
+def render_all_view(data: dict, owners: list, extra_owners: list) -> None:
+    """家族全員の一覧(閲覧専用)。登録・編集・削除は、名義を選んだ画面で行う"""
+    st.caption("👨‍👩‍👧 家族全員の一覧です(閲覧専用)。登録・編集・削除は、名義を選んでから行ってください。")
+    if extra_owners:
+        st.warning(
+            "「通知設定(settings)」に登録がない名義があります: " + "、".join(extra_owners)
+            + "。一覧には表示していますが、名義の選択肢には出ません(通知のしきい値は初期値)。"
+        )
+    brokers = data["brokers"]
+    broker_urls = dict(zip(brokers["証券会社"], brokers["URL"])) if not brokers.empty else {}
+
+    tab_h, tab_w = st.tabs(["保有株(全員)", "注目株(全員)"])
+    with tab_h:
+        with st.spinner("株価を取得中..."):
+            table = build_all_table("holdings", data, owners, broker_urls)
+        if table.empty:
+            st.info("保有株が登録されていません。")
+        else:
+            render_summary(table)
+            st.markdown("##### 名義別の合計(円換算)")
+            st.dataframe(style_sum(owner_summary(table)), hide_index=True)
+            config = {
+                "証券会社": st.column_config.LinkColumn(
+                    "証券会社", display_text=r"#([^#]*)$", help="クリックすると、登録したリンク先が開きます"
+                )
+            }
+            st.markdown("##### 保有株の一覧")
+            st.dataframe(style_table(table, "holdings"), hide_index=True, column_config=config)
+            st.caption(
+                "⚠ = 前日比がその名義のしきい値以上 / 現在値・取得単価は「通貨」列の通貨(円 or USD)、評価額・損益は円換算 / "
+                "含み損益=株価の損益(為替差を除く)、為替込み損益=取得日のレートで計算(推定)"
+            )
+            render_fx_note(table)
+            with st.expander("📦 銘柄ごとの合計(同じ銘柄は家族分を合算)"):
+                st.dataframe(style_sum(stock_summary(table)), hide_index=True)
+
+    with tab_w:
+        with st.spinner("株価を取得中..."):
+            wtable = build_all_table("watch", data, owners)
+        if wtable.empty:
+            st.info("注目株が登録されていません。")
+        else:
+            st.dataframe(style_table(wtable, "watch"), hide_index=True)
+            st.caption("⚠ = 前日比がその名義のしきい値以上 / 現在値・目標価格は「通貨」列の通貨(円 or USD)")
+
+
 def render_settings_tab(owner: str, settings: pd.DataFrame) -> None:
     st.subheader(f"{owner}さんの通知設定")
     row = settings[settings["名義"] == owner].iloc[0]
@@ -683,8 +779,11 @@ def main() -> None:
     data = load_all()
     settings = data["settings"]
     owners = list(settings["名義"])
-    owner = select_owner(owners)
-    threshold = get_threshold(settings, owner)
+    # settings に無い名義(シートに直接入力した行など)も、全員の一覧には含める
+    sheet_owners = list(data["holdings"]["名義"]) + list(data["watch"]["名義"])
+    extra_owners = [o for o in dict.fromkeys(sheet_owners) if o and o not in owners]
+    owner = select_owner(owners + [ALL])
+    threshold = get_threshold(settings, owner)  # 「全員」のときは初期値(一覧では名義ごとのしきい値を使う)
 
     left, right = st.columns([4, 1])
     left.caption(
@@ -694,6 +793,10 @@ def main() -> None:
     if right.button("🔄 最新の株価に更新"):
         clear_prices()
         st.rerun()
+
+    if owner == ALL:
+        render_all_view(data, owners + extra_owners, extra_owners)
+        return
 
     tab_h, tab_w, tab_s = st.tabs(["保有株", "注目株", "通知設定"])
     with tab_h:
