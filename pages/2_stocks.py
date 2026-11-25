@@ -5,16 +5,29 @@
 認証・接続: common.py の setup_page / fetch_sheet / apply_and_save をそのまま使う
 
 スプレッドシートのタブ(1行目がヘッダー。名前は半角英数で一致させる):
-  holdings  名義 / 銘柄コード / 銘柄名 / 取得単価 / 株数
+  holdings  名義 / 銘柄コード / 銘柄名 / 取得単価 / 株数 / 証券会社 / 取得日
   watch     名義 / 銘柄コード / 銘柄名 / 目標価格
   settings  名義 / しきい値(%) / 通知ON
   brokers   証券会社 / URL   (証券会社とリンク先の一覧。家族で共通。無くても他の機能は動く)
 holdings の「証券会社」には、brokers に登録した証券会社名を入れる(表で名前をクリックするとリンク先が開く)。
 ※ログインID・パスワード・口座番号は、スプレッドシートに入れないこと。
+
+【通貨のルール】
+  日本株(7203.T など) … 取得単価・目標価格は「円」
+  米国株(BDX など)    … 取得単価・目標価格は「ドル」(その銘柄の売買通貨で入力する)
+  評価額・含み損益は、米国株を現在のドル円レート(USDJPY=X)で円換算して表示・合計する。
+【取得単価】
+  空欄 = 不明(含み損益は計算しない) / 0 = 無償取得(スピンオフ・株式分配など。評価額の全額が含み益)
+【取得日と為替込み損益】
+  米国株は、取得日(購入日)のドル円レート(終値。休日は直前の営業日)を「取得時レート(推定)」として使い、
+  為替込み損益(円) = 現在値×株数×今のレート − 取得単価×株数×取得時レート を出す。
+  取得日が空欄の米国株は為替込み損益を出さない(「含み損益」=為替差を除いた株価の損益 は出す)。
+  取得単価が0(無償取得)なら取得額は0円なので、取得日がなくても為替込み損益を出す。
 """
+import re
 import time
 import unicodedata
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -29,9 +42,11 @@ from common import apply_and_save, fetch_sheet, setup_page
 CACHE_SECONDS = 300  # 株価を使い回す時間(秒)
 DEFAULT_MEMBERS = ["夫", "妻", "長男", "長女", "その他"]  # ページ1の OWNERS と同じ(settingsタブが空のときだけ使う)
 DEFAULT_THRESHOLD = 3.0  # 前日比 ±% の初期値
+FX_USDJPY = "USDJPY=X"  # ドル円レートの取得に使う
+JST = ZoneInfo("Asia/Tokyo")
 
 COLUMNS = {
-    "holdings": ["名義", "銘柄コード", "銘柄名", "取得単価", "株数", "証券会社"],
+    "holdings": ["名義", "銘柄コード", "銘柄名", "取得単価", "株数", "証券会社", "取得日"],
     "watch": ["名義", "銘柄コード", "銘柄名", "目標価格"],
     "settings": ["名義", "しきい値(%)", "通知ON"],
     "brokers": ["証券会社", "URL"],
@@ -39,13 +54,16 @@ COLUMNS = {
 NO_BROKER = "（選択しない）"
 NUMERIC_COLUMNS = ["取得単価", "株数", "目標価格", "しきい値(%)"]
 TRUE_VALUES = ["TRUE", "1", "はい", "ON"]
+TEXT_COLUMNS = ("銘柄コード", "銘柄名", "証券会社", "通知", "通貨")
 
 
 # ---------------------------------------------------------
 # スプレッドシートの読み書き(common.py の関数を利用)
 # ---------------------------------------------------------
 def num_str(v) -> str:
-    """数値をシートに書く文字列にする(300.0 -> '300'、2500.5 -> '2500.5')"""
+    """数値をシートに書く文字列にする(300.0 -> '300'、2500.5 -> '2500.5')。None は空欄('')"""
+    if v is None:
+        return ""
     v = float(v)
     return str(int(v)) if v.is_integer() else str(round(v, 4))
 
@@ -55,6 +73,23 @@ def default_settings_str() -> pd.DataFrame:
     return pd.DataFrame(
         {"名義": DEFAULT_MEMBERS, "しきい値(%)": [num_str(DEFAULT_THRESHOLD)] * n, "通知ON": ["TRUE"] * n}
     )
+
+
+def parse_date_cell(v):
+    """'2023-05-12' / '2023/5/12' / '2023年5月12日' -> date。空欄・読めない値は None"""
+    s = unicodedata.normalize("NFKC", str(v)).strip()
+    m = re.match(r"^(\d{4})\D+(\d{1,2})\D+(\d{1,2})", s)
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def as_date(v):
+    """date ならそのまま、空欄(None/NaN)は None"""
+    return v if isinstance(v, date) and not isinstance(v, datetime) else None
 
 
 def typed(kind: str, df: pd.DataFrame) -> pd.DataFrame:
@@ -70,6 +105,8 @@ def typed(kind: str, df: pd.DataFrame) -> pd.DataFrame:
     for c in ["名義", "銘柄コード", "銘柄名", "証券会社", "URL"]:
         if c in df:
             df[c] = df[c].astype(str).str.strip()
+    if "取得日" in df:
+        df["取得日"] = df["取得日"].map(parse_date_cell)
     return df
 
 
@@ -173,9 +210,23 @@ def clear_prices() -> None:
 
 
 def normalize_code(raw: str) -> str:
-    """'7203' / '７２０３' / '7203.t' -> '7203.T'"""
+    """日本株は '7203' / '７２０３' / '7203.t' / '285A' -> '7203.T'。
+    米国株などアルファベットのコード('BDX', 'embc')は .T を付けずそのまま('BDX')。"""
     code = unicodedata.normalize("NFKC", raw).strip().upper()
-    return code if code.endswith(".T") else f"{code}.T"
+    if "." in code:
+        return code
+    if re.fullmatch(r"\d{3}[0-9A-Z]", code):  # 日本株: 数字3桁+数字or英字1桁
+        return f"{code}.T"
+    return code
+
+
+def currency_of(code: str) -> str:
+    """銘柄コードから売買通貨を判定: 日本株=円 / サフィックスなし=米国株=USD / それ以外は未対応('?')"""
+    if code.endswith(".T"):
+        return "円"
+    if "." not in code:
+        return "USD"
+    return "?"
 
 
 def fetch_price(code: str) -> dict:
@@ -196,6 +247,32 @@ def fetch_price(code: str) -> dict:
         return {}
     cache[code] = (time.time(), data)
     return data
+
+
+def rate_to_jpy(cur: str):
+    """その通貨1単位あたりの円。円=1.0、USD=ドル円レート。取得できない/未対応は None。"""
+    if cur == "円":
+        return 1.0
+    if cur == "USD":
+        return fetch_price(FX_USDJPY).get("last")
+    return None
+
+
+def fx_on(d: date):
+    """取得日(d)のドル円レート(終値。休日は直前の営業日)。取得できなければ None。過去の値は変わらないので使い回す。"""
+    cache = _store().setdefault("fx_hist", {})
+    if d in cache:
+        return cache[d]
+    try:
+        closes = yf.Ticker(FX_USDJPY).history(start=d - timedelta(days=7), end=d + timedelta(days=1))["Close"].dropna()
+        closes = closes[[x.date() <= d for x in closes.index]]
+        if closes.empty:
+            return None
+        rate = float(closes.iloc[-1])
+    except Exception:
+        return None
+    cache[d] = rate
+    return rate
 
 
 def fetch_name(code: str) -> str:
@@ -223,27 +300,45 @@ def build_table(kind: str, df: pd.DataFrame, threshold: float, broker_urls: dict
     broker_urls = broker_urls or {}
     rows = []
     for _, r in df.iterrows():
-        p = fetch_price(r["銘柄コード"])
+        code = r["銘柄コード"]
+        p = fetch_price(code)
         last, prev = p.get("last"), p.get("prev")
         chg = (last - prev) if last is not None and prev else None
         pct = (chg / prev * 100) if chg is not None else None
-        row = {"銘柄コード": r["銘柄コード"], "銘柄名": r["銘柄名"]}
+        cur = currency_of(code)
+        rate = rate_to_jpy(cur)
+        row = {"銘柄コード": code, "銘柄名": r["銘柄名"]}
         if kind == "holdings":
             row["証券会社"] = broker_link(r.get("証券会社"), broker_urls)
         row.update({
             "通知": "⚠" if pct is not None and abs(pct) >= threshold else "",
+            "通貨": cur,
             "現在値": last,
             "前日比": chg,
             "前日比%": pct,
         })
         if kind == "holdings":
             cost, qty = r["取得単価"], r["株数"]
-            has_cost = pd.notna(cost) and cost > 0  # 空欄・0は「未入力」として扱う
+            has_cost = pd.notna(cost) and cost >= 0  # 空欄だけが「未入力」。0は「無償取得(0円/0ドル)」
+            can_value = last is not None and rate is not None
+            # 取得時レート(推定): 日本株は1、米国株は取得日のドル円(取得日が空欄なら None)
+            buy_date = as_date(r.get("取得日"))
+            buy_rate = 1.0 if cur == "円" else (fx_on(buy_date) if cur == "USD" and buy_date else None)
             row["取得単価"] = cost if has_cost else None
             row["株数"] = qty
-            row["評価額"] = last * qty if last is not None else None
-            row["含み損益"] = (last - cost) * qty if last is not None and has_cost else None
-            row["損益率%"] = (last - cost) / cost * 100 if last is not None and has_cost else None
+            row["取得時レート(推定)"] = buy_rate if cur == "USD" else None
+            # 評価額・含み損益は円換算(米国株は 現在値(ドル) × 株数 × ドル円)
+            row["評価額"] = last * qty * rate if can_value else None
+            row["含み損益"] = (last - cost) * qty * rate if can_value and has_cost else None
+            # 為替込み損益: 取得額(円) = 取得単価 × 株数 × 取得時レート。無償取得(0)ならレート不要で取得額0円
+            if can_value and has_cost and cost == 0:
+                row["為替込み損益"] = last * qty * rate
+            elif can_value and has_cost and buy_rate:
+                row["為替込み損益"] = last * qty * rate - cost * qty * buy_rate
+            else:
+                row["為替込み損益"] = None
+            # 損益率は株価ベース(為替変動は含まない)。取得単価0だと割れないので「-」
+            row["損益率%"] = (last - cost) / cost * 100 if last is not None and has_cost and cost > 0 else None
         else:
             target = r["目標価格"]
             row["目標価格"] = target
@@ -251,9 +346,22 @@ def build_table(kind: str, df: pd.DataFrame, threshold: float, broker_urls: dict
         rows.append(row)
     out = pd.DataFrame(rows)
     for c in out.columns:
-        if c not in ("銘柄コード", "銘柄名", "証券会社", "通知"):
+        if c not in TEXT_COLUMNS:
             out[c] = pd.to_numeric(out[c], errors="coerce")
     return out
+
+
+def _trim(s: str) -> str:
+    return s.rstrip("0").rstrip(".") if "." in s else s
+
+
+def fmt_price(v) -> str:
+    """3941.0 -> '3,941' / 8.08 -> '8.08' / 325.6 -> '325.6'(円もドルも見やすく)"""
+    return _trim(f"{v:,.2f}")
+
+
+def fmt_signed(v) -> str:
+    return _trim(f"{v:+,.2f}")
 
 
 def style_table(table: pd.DataFrame, kind: str):
@@ -263,13 +371,16 @@ def style_table(table: pd.DataFrame, kind: str):
             return ""
         return "color: #d62728" if v < 0 else "color: #2ca02c" if v > 0 else ""
 
-    signed = ["前日比", "前日比%"] + (["含み損益", "損益率%"] if kind == "holdings" else [])
-    fmt = {c: "{:,.1f}" for c in ["現在値", "取得単価", "目標価格"] if c in table}
-    fmt["前日比"] = "{:+,.1f}"
+    signed = ["前日比", "前日比%"] + (["含み損益", "為替込み損益", "損益率%"] if kind == "holdings" else [])
+    fmt = {c: fmt_price for c in ["現在値", "取得単価", "目標価格"] if c in table}
+    fmt["前日比"] = fmt_signed
     fmt.update({c: "{:+.2f}%" for c in ["前日比%", "損益率%", "目標との差%"] if c in table})
     fmt.update({c: "{:,.0f}" for c in ["株数", "評価額"] if c in table})
-    if "含み損益" in table:
-        fmt["含み損益"] = "{:+,.0f}"
+    for c in ["含み損益", "為替込み損益"]:
+        if c in table:
+            fmt[c] = "{:+,.0f}"
+    if "取得時レート(推定)" in table:
+        fmt["取得時レート(推定)"] = "{:,.2f}"
     styler = table.style.format(fmt, na_rep="-")
     apply_color = getattr(styler, "map", None) or styler.applymap  # pandas新旧両対応
     return apply_color(color, subset=[c for c in signed if c in table])
@@ -295,35 +406,67 @@ def select_owner(owners: list) -> str:
 def render_summary(table: pd.DataFrame) -> None:
     total = table["評価額"].sum()
     pnl = table["含み損益"].sum()
-    cost = (table["取得単価"] * table["株数"]).sum()
+    # 取得額(円換算)= 評価額 − 含み損益。取得単価が空欄の銘柄は除く(0の銘柄は取得額0として含む)
+    valid = table["含み損益"].notna()
+    cost = (table.loc[valid, "評価額"] - table.loc[valid, "含み損益"]).sum()
     alerts = int((table["通知"] == "⚠").sum())
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("評価額 合計", f"{total:,.0f} 円")
-    c2.metric("含み損益 合計", f"{pnl:+,.0f} 円", f"{pnl / cost * 100:+.2f}%" if cost else None)
+    c1.metric("評価額 合計(円)", f"{total:,.0f} 円")
+    c2.metric("含み損益 合計(円)", f"{pnl:+,.0f} 円", f"{pnl / cost * 100:+.2f}%" if cost else None)
     c3.metric("銘柄数", f"{len(table)} 銘柄")
     c4.metric("しきい値超え", f"{alerts} 銘柄")
+    if (table["通貨"] == "USD").any():
+        fx = table["為替込み損益"]
+        usd_no_date = int(((table["通貨"] == "USD") & table["取得単価"].notna() & (table["取得単価"] > 0) & fx.isna()).sum())
+        note = f"(取得日が未入力の米国株 {usd_no_date} 銘柄は含まず)" if usd_no_date else ""
+        st.caption(f"💴 為替込み損益 合計: {fx.sum():+,.0f} 円 {note}")
     missing = int(table["取得単価"].isna().sum())
     if missing:
-        st.caption(f"※ 取得単価が未入力の {missing} 銘柄は、含み損益の合計に含めていません。")
+        st.caption(f"※ 取得単価が未入力(空欄)の {missing} 銘柄は、含み損益の合計に含めていません。")
+    no_value = int(table["評価額"].isna().sum())
+    if no_value:
+        st.caption(f"※ 株価または為替レートが取得できなかった {no_value} 銘柄は、評価額の合計に含めていません。")
+
+
+def render_fx_note(table: pd.DataFrame) -> None:
+    """米国株があるとき、円換算に使ったレートを表示する"""
+    if (table["通貨"] == "USD").any():
+        rate = rate_to_jpy("USD")
+        if rate:
+            st.caption(
+                f"💱 米国株は 1ドル={rate:,.2f}円 で円換算(評価額・含み損益)。"
+                "損益率%は株価ベースで、為替の変動は含みません。"
+            )
+        else:
+            st.warning("ドル円レートを取得できなかったため、米国株の評価額・含み損益は表示していません。")
+    if (table["通貨"] == "?").any():
+        st.caption("※ 日本株・米国株以外(通貨が判定できない銘柄)は、円換算していません。")
 
 
 def render_add_form(kind: str, owner: str, df: pd.DataFrame, broker_names: list = ()) -> None:
     with st.expander("➕ 銘柄を登録・更新", expanded=df.empty):
         with st.form(f"add_{kind}_{owner}", clear_on_submit=True):
-            code_in = st.text_input("銘柄コード(例: 7203)")
+            code_in = st.text_input("銘柄コード(日本株は 7203、米国株は BDX のようにティッカー)")
             name_in = st.text_input("銘柄名(空欄なら自動取得)")
             if kind == "holdings":
                 cost = st.number_input(
-                    "取得単価(円)", min_value=0.0, step=1.0,
-                    help="分からない場合は0のままで構いません(その銘柄の含み損益は表示されません)。あとから編集できます。",
+                    "取得単価(日本株は円 / 米国株はドル)", min_value=0.0, step=1.0, value=None,
+                    placeholder="不明なら空欄",
+                    help="無償で取得した株(スピンオフなど)は 0 を入力してください。"
+                         "分からない場合は空欄のままで構いません(その銘柄の含み損益は表示されません)。あとから編集できます。",
                 )
                 qty = st.number_input("株数", min_value=0, step=100, value=100)
+                buy_date = st.date_input(
+                    "取得日(購入日)", value=None, min_value=date(2000, 1, 1), max_value=datetime.now(JST).date(),
+                    help="米国株は、この日のドル円レートで為替込み損益を計算します。分からなければ空欄で構いません。"
+                         "複数回に分けて買った場合は、おおよその日(平均的な時期)を入れてください。",
+                )
                 broker = st.selectbox(
                     "証券会社", [NO_BROKER] + list(broker_names),
                     help="一覧にない場合は、下の「証券会社とリンクの登録」で先に登録してください。",
                 )
             else:
-                target = st.number_input("目標価格(円)", min_value=0.0, step=1.0)
+                target = st.number_input("目標価格(日本株は円 / 米国株はドル)", min_value=0.0, step=1.0)
             submitted = st.form_submit_button("登録")
 
         if not submitted:
@@ -342,6 +485,7 @@ def render_add_form(kind: str, owner: str, df: pd.DataFrame, broker_names: list 
             new = {
                 "銘柄コード": code, "銘柄名": name, "取得単価": num_str(cost), "株数": num_str(qty),
                 "証券会社": "" if broker == NO_BROKER else broker,
+                "取得日": str(buy_date) if buy_date else "",
             }
         else:
             new = {"銘柄コード": code, "銘柄名": name, "目標価格": num_str(target)}
@@ -350,6 +494,11 @@ def render_add_form(kind: str, owner: str, df: pd.DataFrame, broker_names: list 
 
 def _num(v) -> float:
     return float(v) if pd.notna(v) else 0.0
+
+
+def _opt(v):
+    """空欄(NaN)は None、0を含む数値はそのまま"""
+    return float(v) if pd.notna(v) else None
 
 
 def render_edit_form(kind: str, owner: str, df: pd.DataFrame, broker_names: list = ()) -> None:
@@ -362,10 +511,20 @@ def render_edit_form(kind: str, owner: str, df: pd.DataFrame, broker_names: list
         label = st.selectbox("編集する銘柄", list(options), key=f"edit_sel_{kind}_{owner}")
         r = df.iloc[options[label]]
         code = r["銘柄コード"]
+        unit = {"円": "円", "USD": "ドル"}.get(currency_of(code), "現地通貨")
         k = f"{kind}_{owner}_{code}"  # 銘柄を切り替えたとき、入力欄の値も切り替わるようにする
         if kind == "holdings":
-            cost = st.number_input("取得単価(円)", min_value=0.0, step=1.0, value=_num(r["取得単価"]), key=f"edit_cost_{k}")
+            cost = st.number_input(
+                f"取得単価({unit})", min_value=0.0, step=1.0, value=_opt(r["取得単価"]),
+                placeholder="不明なら空欄", key=f"edit_cost_{k}",
+                help="無償で取得した株(スピンオフなど)は 0。不明な場合は空欄。",
+            )
             qty = st.number_input("株数", min_value=0, step=100, value=int(_num(r["株数"])), key=f"edit_qty_{k}")
+            buy_date = st.date_input(
+                "取得日(購入日)", value=as_date(r.get("取得日")), min_value=date(2000, 1, 1),
+                max_value=datetime.now(JST).date(), key=f"edit_date_{k}",
+                help="米国株は、この日のドル円レートで為替込み損益を計算します。空欄でもOKです。",
+            )
             cur_broker = str(r["証券会社"]).strip() if pd.notna(r["証券会社"]) else ""
             names = list(broker_names) + ([cur_broker] if cur_broker and cur_broker not in broker_names else [])
             choices = [NO_BROKER] + names
@@ -375,9 +534,12 @@ def render_edit_form(kind: str, owner: str, df: pd.DataFrame, broker_names: list
             new = {
                 "銘柄コード": code, "銘柄名": r["銘柄名"], "取得単価": num_str(cost), "株数": num_str(qty),
                 "証券会社": "" if broker == NO_BROKER else broker,
+                "取得日": str(buy_date) if buy_date else "",
             }
         else:
-            target = st.number_input("目標価格(円)", min_value=0.0, step=1.0, value=_num(r["目標価格"]), key=f"edit_target_{k}")
+            target = st.number_input(
+                f"目標価格({unit})", min_value=0.0, step=1.0, value=_num(r["目標価格"]), key=f"edit_target_{k}"
+            )
             new = {"銘柄コード": code, "銘柄名": r["銘柄名"], "目標価格": num_str(target)}
         if st.button("更新する", key=f"edit_btn_{k}"):
             apply_and_save(kind, COLUMNS[kind], make_upsert(kind, owner, new), f"{r['銘柄名']}({code})を更新しました。")
@@ -451,7 +613,14 @@ def render_stock_tab(kind: str, owner: str, df: pd.DataFrame, threshold: float, 
                 )
             }
         st.dataframe(style_table(table, kind), hide_index=True, column_config=config)
-        st.caption(f"⚠ = 前日比が ±{threshold:g}% 以上(通知対象)")
+        st.caption(
+            f"⚠ = 前日比が ±{threshold:g}% 以上(通知対象) / "
+            "現在値・取得単価は「通貨」列の通貨(円 or USD)、評価額・損益は円換算 / "
+            "含み損益=株価の損益(為替差を除く)、為替込み損益=取得日のレートで計算(推定)"
+            if kind == "holdings"
+            else f"⚠ = 前日比が ±{threshold:g}% 以上(通知対象) / 現在値・目標価格は「通貨」列の通貨(円 or USD)"
+        )
+        render_fx_note(table)
         render_edit_form(kind, owner, df, broker_names)
         render_delete_form(kind, owner, df)
 
@@ -537,4 +706,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
